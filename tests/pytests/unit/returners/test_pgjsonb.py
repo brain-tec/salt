@@ -367,3 +367,106 @@ def test_get_jids_returns_one_formatted_entry_per_row():
     assert result["20260504000000000002"]["Target"] == "minion-1"
     assert result["20260504000000000002"]["Arguments"] == ["highstate"]
     assert result["20260504000000000002"]["User"] == "salt"
+
+
+def _enter_get_serv(connect_mock):
+    """Enter ``_get_serv`` once with a mocked ``psycopg2.connect`` and a
+    minimal fake connection, so the body opens the connection and we can
+    inspect the kwargs the caller passed to ``connect``."""
+    fake_conn = MagicMock()
+    fake_conn.server_version = 90500
+    connect_mock.return_value = fake_conn
+    with patch("psycopg2.connect", connect_mock):
+        with pgjsonb._get_serv():
+            pass
+
+
+@pytest.mark.skipif(not pgjsonb.HAS_PG, reason="psycopg2 not installed")
+def test__get_serv_omits_connect_timeout_when_not_configured():
+    """Existing deployments must keep their current connect behaviour:
+    when no ``connect_timeout`` is configured, the kwarg is not passed to
+    ``psycopg2.connect`` at all so libpq's default (no app-level timeout)
+    still applies."""
+    connect = MagicMock()
+    with patch.object(pgjsonb, "_get_options", return_value={}):
+        _enter_get_serv(connect)
+    assert "connect_timeout" not in connect.call_args.kwargs
+
+
+@pytest.mark.skipif(not pgjsonb.HAS_PG, reason="psycopg2 not installed")
+def test__get_serv_passes_connect_timeout_when_configured():
+    """When ``connect_timeout`` is configured, it is forwarded to
+    ``psycopg2.connect`` verbatim."""
+    connect = MagicMock()
+    with patch.object(pgjsonb, "_get_options", return_value={"connect_timeout": 5}):
+        _enter_get_serv(connect)
+    assert connect.call_args.kwargs["connect_timeout"] == 5
+
+
+def test__get_options_coerces_string_connect_timeout_to_int():
+    """A string ``connect_timeout`` (as it can arrive from pillar or env)
+    is coerced to int so ``psycopg2.connect`` does not get a string."""
+    with patch.object(
+        pgjsonb.salt.returners,
+        "get_returner_options",
+        return_value={"connect_timeout": "5", "port": "5432"},
+    ):
+        opts = pgjsonb._get_options()
+    assert opts["connect_timeout"] == 5
+    assert isinstance(opts["connect_timeout"], int)
+
+
+def _capture_jids_predicate(executed_calls, marker):
+    """Return the parameterised SQL string from the first call whose text
+    contains ``marker`` (e.g. ``"delete from jids"`` or ``"insert into"``)."""
+    for call_ in executed_calls:
+        if not call_.args:
+            continue
+        sql = call_.args[0]
+        if isinstance(sql, str) and marker in sql:
+            return sql
+    raise AssertionError(
+        f"no execute call contained {marker!r}; "
+        f"saw: {[c.args for c in executed_calls]}"
+    )
+
+
+def test__purge_jobs_keeps_jids_with_any_recent_salt_returns_row():
+    """Regression for the orphan-returns bug: ``_purge_jobs`` must delete
+    a jids row only when every salt_returns row for that jid is older
+    than the cutoff. The previous predicate fired as soon as one old
+    return existed, which left recent returns from the same jid orphaned
+    in salt_returns once the parent was deleted."""
+    cursor = MagicMock()
+    serv = MagicMock()
+    serv.return_value.__enter__.return_value = cursor
+
+    with patch.object(pgjsonb, "_get_serv", serv):
+        pgjsonb._purge_jobs("2026-01-01")
+
+    sql = _capture_jids_predicate(cursor.execute.call_args_list, "delete from jids")
+    # Antijoin: keep the row if any recent salt_returns row exists for it.
+    assert "not exists" in sql.lower()
+    assert "alter_time >= %s" in sql
+    # Defence against regressing to the old predicate.
+    assert "alter_time < %s" not in sql
+
+
+def test__archive_jobs_keeps_jids_with_any_recent_salt_returns_row():
+    """Mirror of the purge test for the archive path. The archive INSERT
+    into ``jids_archive`` must use the same antijoin predicate so that it
+    does not pick up parent rows whose recent returns were left behind in
+    the source table."""
+    cursor = MagicMock()
+    serv = MagicMock()
+    serv.return_value.__enter__.return_value = cursor
+
+    with patch.object(pgjsonb, "_get_serv", serv):
+        pgjsonb._archive_jobs("2026-01-01")
+
+    sql = _capture_jids_predicate(
+        cursor.execute.call_args_list, "insert into jids_archive"
+    )
+    assert "not exists" in sql.lower()
+    assert "alter_time >= %s" in sql
+    assert "alter_time < %s" not in sql

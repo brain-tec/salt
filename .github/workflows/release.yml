@@ -95,6 +95,12 @@ jobs:
           salt-version: "${{ inputs.salt-version }}"
           validate-version: true
 
+      - name: Check For Duplicate Draft Releases
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tools ci check-draft-releases ${{ steps.setup-salt-version.outputs.salt-version }}
+
       - name: Get Salt Releases
         id: get-salt-releases
         env:
@@ -201,7 +207,7 @@ jobs:
 
   publish-pypi:
     name: Publish to PyPi
-    if: ${{ always() && ! failure() && ! cancelled() && github.event.repository.fork != true }}
+    if: ${{ always() && ! failure() && ! cancelled() && github.event.repository.fork != true && !contains(inputs.salt-version, '-') }}
     needs:
       - prepare-workflow
       - release
@@ -251,7 +257,7 @@ jobs:
 
   publish-draft:
     name: Publish Relase v${{ needs.prepare-workflow.outputs.salt-version }}
-    if: ${{ !cancelled() && always() }}
+    if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-22.04
     needs:
       - check-requirements

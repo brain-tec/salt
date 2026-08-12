@@ -737,11 +737,17 @@ class RequestServer(salt.transport.base.DaemonizedRequestServer):
             ctx = None
             if self.ssl is not None:
                 ctx = salt.transport.base.ssl_context(self.ssl, server_side=True)
+            # See issue #69930: pass the configured cap through to the
+            # per-stream Tornado outbound write buffer.  ``ipc_write_buffer``
+            # is the legacy option name kept for master.conf compatibility;
+            # it was a no-op on 3008.x until this wiring was added.
+            max_write_buffer_size = self.opts.get("ipc_write_buffer") or None
             if USE_LOAD_BALANCER:
                 self.req_server = LoadBalancerWorker(
                     self.socket_queue,
                     self.handle_message,
                     ssl_options=ctx,
+                    max_write_buffer_size=max_write_buffer_size,
                 )
             else:
                 if salt.utils.platform.is_windows():
@@ -754,6 +760,7 @@ class RequestServer(salt.transport.base.DaemonizedRequestServer):
                     self.handle_message,
                     ssl_options=ctx,
                     io_loop=io_loop,
+                    max_write_buffer_size=max_write_buffer_size,
                 )
                 self.req_server.add_socket(self._socket)
                 self._socket.listen(self.backlog)
@@ -806,6 +813,11 @@ class SaltMessageServer(tornado.tcpserver.TCPServer):
 
     def __init__(self, message_handler, *args, **kwargs):
         io_loop = kwargs.pop("io_loop", None) or tornado.ioloop.IOLoop.current()
+        # ``ipc_write_buffer`` (the legacy option name preserved for
+        # backwards-compat with ``master.conf``) caps the per-stream
+        # Tornado outbound write buffer.  ``0`` / ``None`` == unlimited
+        # (Tornado default), matching prior behavior.
+        self.max_write_buffer_size = kwargs.pop("max_write_buffer_size", None) or None
         self._closing = False
         super().__init__(*args, **kwargs)
         self.io_loop = io_loop
@@ -823,6 +835,12 @@ class SaltMessageServer(tornado.tcpserver.TCPServer):
         Handle incoming streams and add messages to the incoming queue
         """
         log.trace("Req client %s connected", address)
+        if self.max_write_buffer_size:
+            # See issue #69930: cap the outbound IOStream buffer per accepted
+            # request/reply client so a slow consumer can't grow it without
+            # bound.  Tornado's ``TCPServer`` builds the ``IOStream`` before
+            # dispatching to ``handle_stream``, so we set the attribute here.
+            stream.max_write_buffer_size = self.max_write_buffer_size
         self.clients.append((stream, address))
         unpacker = salt.utils.msgpack.Unpacker()
         try:
@@ -1364,6 +1382,31 @@ class PubServer(tornado.tcpserver.TCPServer):
 
         return _cb
 
+    def _discard_slow_client(self, client, reason=""):
+        """
+        Close and forget a subscriber whose write future didn't drain in
+        the ``publish_drain_timeout``.  Idempotent -- ``client.close``
+        tolerates double-close, and ``set.discard`` is a no-op on absent
+        entries.
+        """
+        if client not in self.clients and getattr(client, "_slow_closed", False):
+            return
+        client._slow_closed = True
+        log.warning(
+            "Publisher discarding slow subscriber %s (%s)",
+            client.address,
+            reason,
+        )
+        try:
+            self.remove_presence_callback(client)
+        except Exception:  # pylint: disable=broad-except
+            pass
+        self.clients.discard(client)
+        try:
+            client.close()
+        except Exception:  # pylint: disable=broad-except
+            pass
+
     def handle_stream(self, stream, address):
         cert = None
         try:
@@ -1384,10 +1427,27 @@ class PubServer(tornado.tcpserver.TCPServer):
                     self._validate_ssl_and_add_client(stream, address)
                 )
                 return
+        self._apply_write_buffer_cap(stream)
         client = Subscriber(stream, address)
         self.clients.add(client)
         stream.set_close_callback(self._discard_on_close(client))
         self.io_loop.create_task(self._stream_read(client))
+
+    def _apply_write_buffer_cap(self, stream):
+        """
+        Cap the accepted stream's outbound write buffer per ``ipc_write_buffer``.
+
+        See issue #69930: the legacy ``salt.transport.ipc`` module was
+        removed in 3008.x but the ``ipc_write_buffer`` opt remained in
+        the config schema.  Without this cap, Tornado defaults the
+        per-stream write buffer to unlimited, so a slow / blocked
+        event-bus subscriber lets the master's outbound bytearray grow
+        without bound (RSS growth observed on prod masters under event
+        burst).  ``0`` / falsy preserves prior behavior (unlimited).
+        """
+        cap = self.opts.get("ipc_write_buffer") or None
+        if cap:
+            stream.max_write_buffer_size = cap
 
     async def _validate_ssl_and_add_client(self, stream, address):
         """
@@ -1409,6 +1469,7 @@ class PubServer(tornado.tcpserver.TCPServer):
                     return
 
                 # Successfully got cert - add client
+                self._apply_write_buffer_cap(stream)
                 client = Subscriber(stream, address)
                 self.clients.add(client)
                 stream.set_close_callback(self._discard_on_close(client))
@@ -1445,20 +1506,56 @@ class PubServer(tornado.tcpserver.TCPServer):
         )
         payload = salt.transport.frame.frame_msg(package)
         to_remove = []
-        # Start writes to every targeted client concurrently so a single
-        # slow subscriber can't stall delivery to the rest of the fleet.
-        # See https://github.com/saltstack/salt/issues/66282 — sequential
-        # ``yield client.stream.write(...)`` was clogging the event
-        # publisher loop, growing per-client write buffers and eventually
-        # wedging the master.
-        write_futures = []
+
+        def _make_drain_task(client):
+            """
+            PATCH: drain a subscriber's write future in a fire-and-forget
+            asyncio task with a bounded per-subscriber timeout.
+
+            Previously ``publish_payload`` awaited each client's write
+            future sequentially.  A single slow subscriber (kernel TCP
+            send buffer full) made ``await future`` never resolve; every
+            subsequent broadcast piled up more pending publish_payload
+            coroutines all blocked on the same subscriber, wedging EP's
+            io_loop.  With EP not draining ``master_event_pull.ipc``,
+            MWorker's ``fire_event`` -> ``stream.write`` blocked in the
+            kernel; SyncWrapper's ``thread.join()`` never returned and
+            every MWorker deadlocked, which in turn wedged MWQ's DEALER
+            send() and cascaded down to minion request timeouts and TCP
+            churn.
+
+            Fire-and-forget with a timeout means ``publish_payload``
+            returns immediately after queueing writes.  Slow subscribers
+            drain in their own tasks.  If a subscriber can't drain in
+            ``publish_drain_timeout`` seconds, it is closed and removed
+            from ``self.clients`` -- fixes the wedge; the peer can
+            reconnect and try again.
+            """
+            drain_timeout = self.opts.get("publish_drain_timeout", 5.0)
+
+            async def _drain(fut):
+                try:
+                    await asyncio.wait_for(fut, timeout=drain_timeout)
+                except tornado.iostream.StreamClosedError:
+                    self._discard_slow_client(client, reason="stream closed")
+                except asyncio.TimeoutError:
+                    self._discard_slow_client(
+                        client, reason=f"drain timeout {drain_timeout}s"
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    log.warning("Publisher drain to %s failed: %s", client.address, exc)
+                    self._discard_slow_client(client, reason=str(exc))
+
+            return _drain
+
         if topic_list:
             for topic in topic_list:
                 sent = False
                 for client in list(self.clients):
                     if topic == client.id_:
                         try:
-                            write_futures.append((client, client.stream.write(payload)))
+                            fut = client.stream.write(payload)
+                            asyncio.ensure_future(_make_drain_task(client)(fut))
                             sent = True
                         except tornado.iostream.StreamClosedError:
                             to_remove.append(client)
@@ -1467,14 +1564,10 @@ class PubServer(tornado.tcpserver.TCPServer):
         else:
             for client in list(self.clients):
                 try:
-                    write_futures.append((client, client.stream.write(payload)))
+                    fut = client.stream.write(payload)
+                    asyncio.ensure_future(_make_drain_task(client)(fut))
                 except tornado.iostream.StreamClosedError:
                     to_remove.append(client)
-        for client, future in write_futures:
-            try:
-                await future
-            except tornado.iostream.StreamClosedError:
-                to_remove.append(client)
         for client in to_remove:
             log.debug(
                 "Subscriber at %s has disconnected from publisher", client.address

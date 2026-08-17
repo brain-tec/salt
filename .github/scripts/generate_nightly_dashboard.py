@@ -143,13 +143,18 @@ def parse_junit_counts(junit_dir: Path) -> dict:
         }
 
     Notes:
-      - `tests` counts every `<testcase>` occurrence across all JUnit files
-        (i.e. executions — the same logical test running on multiple OS
-        slugs / transports / FIPS variants each add to it).
+      - `tests` counts every `<testcase>` occurrence that actually ran --
+        passed, failed, or flaky. Skipped testcases are counted separately
+        under `skipped` and are NOT included in `tests` (they never
+        executed a test body; pytest skipped them due to a marker or
+        missing fixture). This matches how CI operators think of "tests
+        that ran" vs "tests that were collected but excluded".
+      - The same logical test running on multiple OS slugs / transports /
+        FIPS variants each add to `tests`.
       - `unique` is the deduplicated count of distinct `(classname, name)`
-        tuples across ALL artifacts. It is a top-level total only; the
-        per-bucket breakdown stays as executions since that maps cleanly
-        onto how CI is scheduled.
+        tuples across ALL artifacts (excluding skipped). It is a top-level
+        total only; the per-bucket breakdown stays as executions since
+        that maps cleanly onto how CI is scheduled.
     """
     totals = _empty_bucket()
     by_bucket: dict = defaultdict(_empty_bucket)
@@ -158,8 +163,36 @@ def parse_junit_counts(junit_dir: Path) -> dict:
     if not junit_dir.exists():
         return {"totals": {**totals, "unique": 0}, "by_suite_os": {}}
 
-    for artifact_dir in sorted(p for p in junit_dir.iterdir() if p.is_dir()):
-        m = ARTIFACT_RE.match(artifact_dir.name)
+    # Dedupe re-run job artifact uploads. When a GH Actions test job is retried
+    # (either by the workflow's re-run of failed jobs, or by an operator
+    # clicking "Re-run failed jobs"), the second attempt uploads its JUnit
+    # results as a *new* artifact directory with the same
+    # (slug, transport, chunk, group) but a fresher <ts>. Walking both would
+    # double-count that chunk's tests. Keep only the highest-<ts> upload per
+    # (slug, transport, chunk, group). Dirs whose names don't match the schema
+    # are always kept (their content classification falls into the "unknown"
+    # bucket which we don't try to dedupe).
+    latest_dir: dict = {}
+    unmatched_dirs: list = []
+    for d in sorted(p for p in junit_dir.iterdir() if p.is_dir()):
+        m = ARTIFACT_RE.match(d.name)
+        if not m:
+            unmatched_dirs.append(d)
+            continue
+        key = (
+            m.group("slug"),
+            m.group("transport") or "",
+            m.group("chunk"),
+            m.group("group"),
+        )
+        ts = int(m.group("ts"))
+        existing = latest_dir.get(key)
+        if existing is None or ts > existing[0]:
+            latest_dir[key] = (ts, d, m)
+    ordered = [(d, m) for (_ts, d, m) in latest_dir.values()]
+    ordered += [(d, None) for d in unmatched_dirs]
+
+    for artifact_dir, m in ordered:
         if m:
             chunk = m.group("chunk")
             slug = m.group("slug")
@@ -197,12 +230,15 @@ def parse_junit_counts(junit_dir: Path) -> dict:
                     if rer in ("passed", "skipped"):
                         outcome = "flaky"
                     # rer == "failed" -> keep as failed
-                totals["tests"] += 1
+                # `tests` = testcases that actually ran (passed/failed/flaky).
+                # Skipped are counted in the `skipped` bucket but not `tests`.
+                if outcome != "skipped":
+                    totals["tests"] += 1
+                    by_bucket[(chunk, slug)]["tests"] += 1
                 totals[outcome] += 1
-                by_bucket[(chunk, slug)]["tests"] += 1
                 by_bucket[(chunk, slug)][outcome] += 1
                 cls, name = key
-                if cls or name:
+                if outcome != "skipped" and (cls or name):
                     unique_ids.add(key)
 
     return {
@@ -259,6 +295,38 @@ def render_index_html(history: list) -> str:
         unique = totals.get("unique", 0)
         by_suite_os = counts.get("by_suite_os", {}) or {}
 
+        # Per-OS table: aggregate every "chunk|slug" bucket by the slug
+        # (i.e. sum all suite chunks that ran on the same OS).
+        per_os: dict = defaultdict(
+            lambda: {"tests": 0, "flaky": 0, "failed": 0, "skipped": 0}
+        )
+        for key, c in by_suite_os.items():
+            os_name = key.split("|", 1)[1] if "|" in key else "unknown"
+            per_os[os_name]["tests"] += c.get("tests", 0)
+            per_os[os_name]["flaky"] += c.get("flaky", 0)
+            per_os[os_name]["failed"] += c.get(
+                "failed", c.get("failures", 0) + c.get("errors", 0)
+            )
+            per_os[os_name]["skipped"] += c.get("skipped", 0)
+        per_os_rows = "".join(
+            f"<tr>"
+            f"<td>{html.escape(os_name)}</td>"
+            f'<td>{c["tests"]:,}</td>'
+            f'<td class="num-flaky">{c["flaky"]}</td>'
+            f'<td class="num-fail">{c["failed"]}</td>'
+            f'<td>{c["skipped"]:,}</td>'
+            f"</tr>"
+            for os_name, c in sorted(per_os.items())
+        )
+        per_os_html = (
+            f'<table class="detail"><thead><tr>'
+            f"<th>os</th><th>tests</th><th>flaky</th><th>failed</th><th>skip</th>"
+            f"</tr></thead>"
+            f"<tbody>{per_os_rows}</tbody></table>"
+            if per_os
+            else ""
+        )
+
         # Detail table (per suite × os).
         detail_rows = "".join(
             f"<tr>"
@@ -271,7 +339,7 @@ def render_index_html(history: list) -> str:
             f"</tr>"
             for k, c in sorted(by_suite_os.items())
         )
-        detail_html = (
+        detail_by_suite_html = (
             f'<table class="detail"><thead><tr>'
             f"<th>suite</th><th>os</th>"
             f"<th>tests</th><th>flaky</th><th>failed</th><th>skip</th>"
@@ -280,6 +348,25 @@ def render_index_html(history: list) -> str:
             if by_suite_os
             else "<em>no test-run artifacts parsed</em>"
         )
+
+        # Side-by-side: suite × OS on the left, per-OS on the right.
+        left_pane = (
+            '<div class="detail-pane">'
+            '<div class="detail-section-title">Per suite &times; OS</div>'
+            f"{detail_by_suite_html}"
+            "</div>"
+        )
+        right_pane = (
+            (
+                '<div class="detail-pane">'
+                '<div class="detail-section-title">Per OS</div>'
+                f"{per_os_html}"
+                "</div>"
+            )
+            if per_os_html
+            else ""
+        )
+        detail_html = f'<div class="detail-flex">{left_pane}{right_pane}</div>'
 
         release_url = html.escape(e.get("release_url", "#"))
         run_url = html.escape(e.get("nightly_run_url", "#"))
@@ -329,8 +416,11 @@ def render_index_html(history: list) -> str:
   code {{ font-size: 0.85em; background: #f6f8fa; padding: 1px 4px; border-radius: 3px; }}
   a {{ color: #0969da; text-decoration: none; }}
   a:hover {{ text-decoration: underline; }}
-  .detail {{ margin: 0.5em 0 0.5em 1em; width: auto; font-size: 0.85em; }}
+  .detail {{ margin: 0.5em 0 0.5em 0; width: auto; font-size: 0.85em; }}
   .detail th, .detail td {{ border-bottom: 1px solid #f0f0f0; }}
+  .detail-section-title {{ margin: 0.75em 0 0.25em 0; font-weight: 600; font-size: 0.85em; color: #57606a; }}
+  .detail-flex {{ display: flex; gap: 2em; align-items: flex-start; margin-left: 1em; flex-wrap: wrap; }}
+  .detail-pane {{ min-width: 20em; }}
 </style>
 <script>
   function toggle(id) {{

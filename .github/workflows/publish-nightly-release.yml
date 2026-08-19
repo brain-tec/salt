@@ -143,6 +143,58 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           merge-multiple: false
 
+      - name: backfill JUnit artifacts that download-artifact silently dropped
+
+        # actions/download-artifact@v4 has been observed to drop ~10% of
+        # `testrun-junit-artifacts-*` items past some per-run size threshold
+        # (e.g. 8/18 3008.x publish 32089946413: "Total of 300 artifact(s)
+        # downloaded" against 336 that exist). The dropped ones don't error
+        # -- they just never land in $path -- so the dashboard ends up
+        # computing tests from a subset and showing spurious day-over-day
+        # drift. Cross-check what actually landed against the API's
+        # authoritative list and pull anything missing via `gh api ... /zip`.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p junit-artifacts
+          # Expected: (id\tname) for every testrun-junit-artifacts-* artifact
+          # attached to the triggering nightly.yml run.
+          gh api "repos/${REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100" \
+            --paginate \
+            --jq '.artifacts[] | select(.name | test("^testrun-junit-artifacts-")) | "\(.id)\t\(.name)"' \
+            > /tmp/expected-junit-artifacts.tsv
+          total=$(wc -l < /tmp/expected-junit-artifacts.tsv | tr -d ' ')
+          existing=$(find junit-artifacts -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
+          echo "expected: ${total}   already-downloaded: ${existing}"
+
+          missing_count=0
+          while IFS=$'\t' read -r id name; do
+            if [ -d "junit-artifacts/${name}" ]; then
+              continue
+            fi
+            missing_count=$((missing_count + 1))
+            echo "  backfilling ${name} (id=${id})"
+            mkdir -p "junit-artifacts/${name}"
+            # The /zip endpoint 302-redirects to a signed URL that gh api
+            # handles transparently. Per-artifact failure is non-fatal --
+            # dashboard still runs on whatever subset landed.
+            if gh api -H 'Accept: application/vnd.github+json' \
+                 "repos/${REPO}/actions/artifacts/${id}/zip" \
+                 > "/tmp/backfill-${id}.zip" 2>/dev/null
+            then
+              unzip -q -o "/tmp/backfill-${id}.zip" -d "junit-artifacts/${name}" || true
+            else
+              echo "    WARN: /zip fetch failed for ${name}"
+            fi
+            rm -f "/tmp/backfill-${id}.zip"
+          done < /tmp/expected-junit-artifacts.tsv
+
+          final=$(find junit-artifacts -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
+          echo "backfilled: ${missing_count}   final: ${final}/${total}"
+
       - name: extract salt version from a built package name
 
         id: salt-version
@@ -172,10 +224,13 @@ jobs:
           # fall back to reading the just-created GitHub Release's asset list —
           # gh release view returns the authoritative filenames.
           probe_from_file() {
+            # A valid salt version always starts with a digit (e.g. 3008.2+206.gbc6d557fcb).
+            # Reject any captured group that doesn't, so subpackage names like
+            # `salt-debuginfo-...`, `salt-common-...`, `salt-dbg_...` -- which slip
+            # past the `-name` filter -- don't get returned as "version=debuginfo-...".
             local f="$1"
             local n
             n=$(basename "$f")
-            # Try each shape in order.
             for pat in \
               's|^salt-\(.*\)-onedir-.*|\1|p' \
               's|^salt-\(.*\)\.tar\.gz$|\1|p' \
@@ -183,10 +238,9 @@ jobs:
               's|^salt_\(.*\)-[0-9]*_[^_]*\.deb$|\1|p'; do
               local v
               v=$(echo "$n" | sed -n "$pat")
-              if [ -n "$v" ]; then
-                echo "$v"
-                return
-              fi
+              case "$v" in
+                [0-9]*) echo "$v"; return ;;
+              esac
             done
           }
 

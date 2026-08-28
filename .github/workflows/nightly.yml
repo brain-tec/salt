@@ -471,6 +471,7 @@ jobs:
       - build-source-tarball
       - build-salt-onedir
     uses: ./.github/workflows/build-packages.yml
+    secrets: inherit
     with:
       salt-version: "${{ needs.prepare-workflow.outputs.salt-version }}"
       cache-prefix: ${{ needs.prepare-workflow.outputs.cache-seed }}
@@ -483,6 +484,7 @@ jobs:
       environment: nightly
       sign-macos-packages: true
       sign-rpm-packages: true
+      sign-deb-packages: true
       sign-windows-packages: false
 
   build-pkgs-src:
@@ -492,6 +494,7 @@ jobs:
       - prepare-workflow
       - build-source-tarball
     uses: ./.github/workflows/build-packages.yml
+    secrets: inherit
     with:
       salt-version: "${{ needs.prepare-workflow.outputs.salt-version }}"
       cache-prefix: ${{ needs.prepare-workflow.outputs.cache-seed }}
@@ -504,6 +507,7 @@ jobs:
       environment: nightly
       sign-macos-packages: true
       sign-rpm-packages: true
+      sign-deb-packages: true
       sign-windows-packages: false
   build-ci-deps:
     name: CI Deps

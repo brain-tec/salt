@@ -82,7 +82,7 @@ class SaltVersionsInfo(type):
     PHOSPHORUS    = SaltVersion("Phosphorus"   , info=3005,       released=True)
     SULFUR        = SaltVersion("Sulfur"       , info=3006,       released=True)
     CHLORINE      = SaltVersion("Chlorine"     , info=3007,       released=True)
-    ARGON         = SaltVersion("Argon"        , info=3008)
+    ARGON         = SaltVersion("Argon"        , info=3008,       released=True)
     POTASSIUM     = SaltVersion("Potassium"    , info=3009)
     CALCIUM       = SaltVersion("Calcium"      , info=3010)
     SCANDIUM      = SaltVersion("Scandium"     , info=3011)
@@ -645,8 +645,13 @@ def __discover_version(saltstack_version):
                 "describe",
                 "--tags",
                 "--long",
+                # Constrain to the branch's own major (3008.x) so tags
+                # from other majors reachable in the git graph do not hijack
+                # the detected version. Merged forward from 3007.x's
+                # v3007.* constraint (see git log for f3ffc8f9c9ea) and
+                # rebased to this branch's major.
                 "--match",
-                "v[0-9]*",
+                "v3008.*",
                 "--always",
                 "--candidates=150",
             ],

@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import gc
 import logging
+import os
 import sys
 import threading
 import types
@@ -95,6 +96,13 @@ class SyncWrapper:
             close_methods = []
         self.loop_kwarg = loop_kwarg
         self.cls = cls
+        # Record creating pid so a forked child that inherits this wrapper via
+        # copy-on-write does NOT emit an ``unclosed SyncWrapper`` warning in
+        # its ``__del__`` -- the parent still owns the wrapped ``obj`` +
+        # io_loop + asyncio_loop; touching them from a child would double-
+        # close the parent's resources.  Same rationale + pattern as the
+        # transport classes patched in this PR for ``salt/transport/tcp.py``.
+        self._creator_pid = os.getpid()
         if loop_kwarg:
             kwargs[self.loop_kwarg] = self.io_loop
         with current_ioloop(self.io_loop):
@@ -186,16 +194,29 @@ class SyncWrapper:
                 if pending_tasks:
                     for task in pending_tasks:
                         task.cancel()
-                    gathered = asyncio.gather(*pending_tasks, return_exceptions=True)
+
+                    # ``asyncio.gather`` has no ``loop`` argument any more, so it
+                    # resolves the loop from the calling context.  ``close()``
+                    # runs outside ``self.asyncio_loop`` -- the thread's current
+                    # loop is a different one -- so on Python 3.14 gathering
+                    # tasks that belong to ``self.asyncio_loop`` raises
+                    # ``ValueError: The future belongs to a different loop than
+                    # the one specified as the loop argument``.  Earlier versions
+                    # took the loop from the first future and let it pass.
+                    #
+                    # Build the gather *inside* the loop instead, where the
+                    # running loop is the right one on every version.
+                    async def _drain(tasks):
+                        await asyncio.gather(*tasks, return_exceptions=True)
+
+                    drain = _drain(pending_tasks)
                     try:
-                        self.asyncio_loop.run_until_complete(gathered)
+                        self.asyncio_loop.run_until_complete(drain)
                     except Exception:  # pylint: disable=broad-except
-                        # ``gathered`` is a Future; if run_until_complete bailed
-                        # part-way we still need to make sure the Future is
-                        # consumed so its exception (if any) isn't logged as
-                        # unhandled.  Tasks already cancelled above.
-                        if not gathered.done():
-                            gathered.cancel()
+                        # Close the coroutine we just built so it is not
+                        # garbage-collected unawaited, which would emit a
+                        # RuntimeWarning on stderr.  Tasks already cancelled.
+                        drain.close()
 
             if self._loop_can_run_until_complete(self.asyncio_loop):
                 shutdown_agens = self.asyncio_loop.shutdown_asyncgens()
@@ -429,10 +450,26 @@ class SyncWrapper:
         # leaked socketpairs (~902 fds) per minion, tripping the
         # 1024-file ulimit critical threshold and the minion's own
         # sock-throttle logic.
+        #
+        # Use ``self.__dict__.get(...)`` rather than ``getattr()`` for the
+        # attribute probes below: ``SyncWrapper.__getattr__`` delegates
+        # missing attributes to ``self.obj``, so a partially-initialized
+        # instance (``object.__new__`` bypass, or ``__init__`` raised
+        # before ``self.obj`` was assigned) would recurse infinitely
+        # through ``__getattr__`` while the finalizer is running.
+        _creator_pid = self.__dict__.get("_creator_pid")
+        if _creator_pid is not None and os.getpid() != _creator_pid:
+            # Forked child: the parent still owns the wrapped ``obj`` /
+            # io_loop / asyncio_loop; do NOT touch them here (that would
+            # break the parent's transport) and do NOT emit a leak warning
+            # (this wrapper is not our responsibility).  Same rationale as
+            # the transport-class ``__del__`` guards in this PR.
+            return
         try:
-            unclosed = getattr(self, "obj", None) is not None or (
-                getattr(self, "asyncio_loop", None) is not None
-                and not self.asyncio_loop.is_closed()
+            _obj = self.__dict__.get("obj")
+            _asyncio_loop = self.__dict__.get("asyncio_loop")
+            unclosed = _obj is not None or (
+                _asyncio_loop is not None and not _asyncio_loop.is_closed()
             )
         except Exception:  # pylint: disable=broad-except
             return

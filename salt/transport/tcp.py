@@ -1340,7 +1340,13 @@ class Subscriber:
         self.address = address
         self._closing = False
         self._read_until_future = None
+        # ``PubServer.handle_stream`` assigns the ``_stream_read`` Task
+        # here so ``PubServer._discard_on_close`` can cancel it on stream
+        # close.  Cancelling releases the coroutine frame that pins the
+        # per-connection 1 MiB msgpack ``Unpacker`` buffer.
+        self._read_task = None
         self.id_ = None
+        self._creator_pid = os.getpid()
 
     def close(self):
         if self._closing:
@@ -1359,7 +1365,14 @@ class Subscriber:
 
     # pylint: disable=W1701
     def __del__(self):
-        if not self._closing:
+        if getattr(self, "_creator_pid", None) is not None and (
+            os.getpid() != self._creator_pid
+        ):
+            # Forked child: the parent still owns the underlying FDs; do NOT
+            # close them here (that would break the parent's transport) and
+            # do NOT emit a leak warning (this object is not our responsibility).
+            return
+        if not getattr(self, "_closing", True):
             salt.utils.resource_warnings.warn_until_close(
                 f"unclosed publish subscriber {self!r}", source=self, log=log
             )
@@ -1474,9 +1487,43 @@ class PubServer(tornado.tcpserver.TCPServer):
         ``EventPublisher`` process observed over 24 h uptime.  This
         matches the ``discard_after_closed`` callback the 3006.x
         ``IPCMessagePublisher`` installed.
+
+        Presence/set removal alone is not enough on the per-job path.
+        ``_stream_read`` was scheduled as an asyncio ``Task`` at
+        connection accept time and awaits ``stream.read_bytes(...)``.
+        The task pins its coroutine frame -> the local ``unpacker``
+        (a msgpack ``Unpacker`` with a 1 MiB internal buffer) and the
+        ``client`` local, even after the ``Subscriber`` is dropped from
+        ``self.clients``.  Tracemalloc on a live 3008.x minion under
+        132-job / 5-min load showed +140 pinned ``Subscriber`` and +140
+        pinned ``Unpacker`` instances (~142 MiB RSS retention) -- the
+        objects were only GC'd on eventual very-delayed StreamClosedError,
+        or never at all if the FIN did not translate promptly.  Fix:
+        cancel the read task and force-close the client stream from the
+        close callback.  Both are idempotent.
         """
 
         def _cb():
+            # Cancel the pending _stream_read task first so any awaiting
+            # read_bytes raises CancelledError promptly and the
+            # coroutine frame (with its 1 MiB Unpacker) is released
+            # regardless of whether client.close() succeeds in
+            # translating the FIN to a StreamClosedError.
+            read_task = getattr(client, "_read_task", None)
+            if read_task is not None and not read_task.done():
+                read_task.cancel()
+            # Force-close the stream/Subscriber -- belt AND suspenders.
+            # Subscriber.close() is idempotent and consumes the read
+            # future's exception to avoid the "Future exception was
+            # never retrieved" warning.
+            try:
+                client.close()
+            except Exception:  # pylint: disable=broad-except
+                log.debug(
+                    "Ignoring error closing subscriber %r on stream close",
+                    client,
+                    exc_info=True,
+                )
             self.remove_presence_callback(client)
             self.clients.discard(client)
 
@@ -1538,7 +1585,12 @@ class PubServer(tornado.tcpserver.TCPServer):
         client = Subscriber(stream, address)
         self.clients.add(client)
         stream.set_close_callback(self._discard_on_close(client))
-        self.io_loop.create_task(self._stream_read(client))
+        # Store the Task on the Subscriber so ``_discard_on_close`` can
+        # cancel it -- otherwise the coroutine frame retains its
+        # ``unpacker`` (1 MiB Unpacker buffer) and ``client`` locals
+        # for the lifetime of the ioloop's task set even after the
+        # Subscriber is dropped from ``self.clients``.
+        client._read_task = self.io_loop.create_task(self._stream_read(client))
 
     def _apply_write_buffer_cap(self, stream):
         """
@@ -1580,7 +1632,10 @@ class PubServer(tornado.tcpserver.TCPServer):
                 client = Subscriber(stream, address)
                 self.clients.add(client)
                 stream.set_close_callback(self._discard_on_close(client))
-                self.io_loop.create_task(self._stream_read(client))
+                # Store the Task on the Subscriber so ``_discard_on_close``
+                # can cancel it and release the coroutine frame's 1 MiB
+                # ``Unpacker`` local.  See ``handle_stream`` for details.
+                client._read_task = self.io_loop.create_task(self._stream_read(client))
                 return
             except AttributeError as exc:
                 # Socket has no SSL - this shouldn't happen here but reject just in case
@@ -1789,6 +1844,7 @@ class TCPPuller:
         else:
             self.io_loop = salt.utils.asynchronous.aioloop(io_loop)
         self._closing = False
+        self._creator_pid = os.getpid()
 
     def start(self):
         """
@@ -1927,7 +1983,14 @@ class TCPPuller:
 
     # pylint: disable=W1701
     def __del__(self):
-        if not self._closing:
+        if getattr(self, "_creator_pid", None) is not None and (
+            os.getpid() != self._creator_pid
+        ):
+            # Forked child: the parent still owns the underlying FDs; do NOT
+            # close them here (that would break the parent's transport) and
+            # do NOT emit a leak warning (this object is not our responsibility).
+            return
+        if not getattr(self, "_closing", True):
             salt.utils.resource_warnings.warn_until_close(
                 f"unclosed tcp puller {self!r}", source=self, log=log
             )
@@ -1989,6 +2052,7 @@ class PublishServer(salt.transport.base.DaemonizedPublishServer):
         self.pub_server = None
         self.io_loop = None
         self._closing = False
+        self._creator_pid = os.getpid()
 
     @classmethod
     def support_ssl(cls):
@@ -2310,15 +2374,26 @@ class PublishServer(salt.transport.base.DaemonizedPublishServer):
         # minion's local event bus (~450 leaked pull.ipc client FDs
         # under sustained stress -> ulimit trip).  Close every cached
         # publisher we still hold before dropping the map.
+        #
+        # PATCH (#70175 round 2): call ``pub.close()`` rather than reaching
+        # into ``pub.stream`` directly.  The stream-only close released
+        # the socket FD but never flipped ``pub._closing = True``, so
+        # every cached publisher tripped ``_TCPPubServerPublisher.__del__``
+        # at GC and emitted the "unclosed publisher client"
+        # ``ResourceWarning`` -- the third warning of the cascade the
+        # user reported on 3008.2+506 (round 1 closed the outer
+        # ``PublishServer`` + ``pub_sock`` SyncWrapper via
+        # ``MinionManager.destroy``; the raw cached publishers were
+        # still leaking their own warning).  ``_TCPPubServerPublisher.close``
+        # is idempotent (early-return on ``_closing``) and subsumes the
+        # stream close.
         per_loop = getattr(self, "_async_pub_by_loop", None)
         if per_loop is not None:
             for pub, _lock in list(per_loop.values()):
-                stream = getattr(pub, "stream", None)
-                if stream is not None and not stream.closed():
-                    try:
-                        stream.close()
-                    except Exception:  # pylint: disable=broad-except
-                        pass
+                try:
+                    pub.close()
+                except Exception:  # pylint: disable=broad-except
+                    pass
             try:
                 per_loop.clear()
             except Exception:  # pylint: disable=broad-except
@@ -2341,7 +2416,14 @@ class PublishServer(salt.transport.base.DaemonizedPublishServer):
 
     # pylint: disable=W1701
     def __del__(self):
-        if not self._closing:
+        if getattr(self, "_creator_pid", None) is not None and (
+            os.getpid() != self._creator_pid
+        ):
+            # Forked child: the parent still owns the underlying FDs; do NOT
+            # close them here (that would break the parent's transport) and
+            # do NOT emit a leak warning (this object is not our responsibility).
+            return
+        if not getattr(self, "_closing", True):
             salt.utils.resource_warnings.warn_until_close(
                 f"unclosed publish server {self!r}", source=self, log=log
             )
@@ -2406,6 +2488,7 @@ class _TCPPubServerPublisher:
         self.unpacker = salt.utils.msgpack.Unpacker(raw=False)
         self._connecting_future = None
         self.max_write_buffer_size = max_write_buffer_size or None
+        self._creator_pid = os.getpid()
 
     def connected(self):
         return self.stream is not None and not self.stream.closed()
@@ -2533,7 +2616,14 @@ class _TCPPubServerPublisher:
 
     # pylint: disable=W1701
     def __del__(self):
-        if not self._closing:
+        if getattr(self, "_creator_pid", None) is not None and (
+            os.getpid() != self._creator_pid
+        ):
+            # Forked child: the parent still owns the underlying FDs; do NOT
+            # close them here (that would break the parent's transport) and
+            # do NOT emit a leak warning (this object is not our responsibility).
+            return
+        if not getattr(self, "_closing", True):
             salt.utils.resource_warnings.warn_until_close(
                 f"unclosed publisher client {self!r}", source=self, log=log
             )

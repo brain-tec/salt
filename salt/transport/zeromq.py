@@ -17,6 +17,7 @@ import stat
 import sys
 import threading
 import uuid
+import weakref
 import zlib
 from random import randint
 
@@ -592,18 +593,31 @@ class RequestServer(salt.transport.base.DaemonizedRequestServer):
             self.opts, secrets=secrets or getattr(self, "secrets", None)
         )
 
-        while True:
-            if self.clients.closed or self.workers.closed:
-                break
-            try:
-                zmq.device(zmq.QUEUE, self.clients, self.workers)
-            except zmq.ZMQError as exc:
-                if exc.errno == errno.EINTR:
-                    continue
-                raise
-            except (KeyboardInterrupt, SystemExit):
-                break
-        # context.term()
+        try:
+            while True:
+                if self.clients.closed or self.workers.closed:
+                    break
+                try:
+                    zmq.device(zmq.QUEUE, self.clients, self.workers)
+                except zmq.ZMQError as exc:
+                    if exc.errno == errno.EINTR:
+                        continue
+                    raise
+                except (KeyboardInterrupt, SystemExit):
+                    break
+        finally:
+            # Without an explicit teardown here the local ``context`` goes
+            # out of scope with sockets still open, and ``Context.__del__``
+            # fires from whatever thread happens to run GC.  Under pyzmq
+            # >= 24 that finalizer calls ``destroy()`` which blocks in
+            # ``zmq_ctx_term()`` on any queued undeliverable send --
+            # indefinitely if the peer is gone.  Sockets here have
+            # LINGER=1000/1 (finite) so we can safely close+term.
+            if not self.clients.closed:
+                self.clients.close()
+            if not self.workers.closed:
+                self.workers.close()
+            context.term()
 
     def zmq_device_pooled(self, worker_pools, secrets=None):
         """
@@ -713,66 +727,74 @@ class RequestServer(salt.transport.base.DaemonizedRequestServer):
         for pool_dealer in self.pool_workers.values():
             poller.register(pool_dealer, zmq.POLLIN)
 
-        while True:
-            if self.clients.closed:
-                break
+        try:
+            while True:
+                if self.clients.closed:
+                    break
 
-            try:
-                socks = dict(poller.poll())
+                try:
+                    socks = dict(poller.poll())
 
-                # Handle incoming responses from worker pools
-                # DEALER preserves the envelope, so we get: [client_id, b"", response]
-                for pool_name, pool_dealer in self.pool_workers.items():
-                    if pool_dealer in socks:
-                        # Receive message from DEALER (envelope is preserved)
-                        msg = pool_dealer.recv_multipart()
-                        if len(msg) >= 3:
-                            # Forward entire envelope back to ROUTER -> client
-                            self.clients.send_multipart(msg)
+                    # Handle incoming responses from worker pools
+                    # DEALER preserves the envelope, so we get: [client_id, b"", response]
+                    for pool_name, pool_dealer in self.pool_workers.items():
+                        if pool_dealer in socks:
+                            # Receive message from DEALER (envelope is preserved)
+                            msg = pool_dealer.recv_multipart()
+                            if len(msg) >= 3:
+                                # Forward entire envelope back to ROUTER -> client
+                                self.clients.send_multipart(msg)
 
-                # Handle incoming request from client (minion)
-                if self.clients in socks:
-                    # Receive multipart message: [client_id, b"", payload]
-                    msg = self.clients.recv_multipart()
-                    if len(msg) < 3:
-                        continue
+                    # Handle incoming request from client (minion)
+                    if self.clients in socks:
+                        # Receive multipart message: [client_id, b"", payload]
+                        msg = self.clients.recv_multipart()
+                        if len(msg) < 3:
+                            continue
 
-                    payload_raw = msg[2]
+                        payload_raw = msg[2]
 
-                    # Decode payload to determine which pool should handle this
-                    try:
-                        payload = salt.payload.loads(payload_raw)
-                        pool_name = router.route_request(payload)
+                        # Decode payload to determine which pool should handle this
+                        try:
+                            payload = salt.payload.loads(payload_raw)
+                            pool_name = router.route_request(payload)
 
-                        if pool_name not in self.pool_workers:
-                            log.error(
-                                "Unknown pool '%s' for routing. Using first available pool.",
-                                pool_name,
+                            if pool_name not in self.pool_workers:
+                                log.error(
+                                    "Unknown pool '%s' for routing. Using first available pool.",
+                                    pool_name,
+                                )
+                                pool_name = next(iter(self.pool_workers.keys()))
+
+                            # Forward entire envelope to appropriate pool's DEALER
+                            # DEALER will preserve the envelope when forwarding to REQ workers
+                            pool_dealer = self.pool_workers[pool_name]
+                            pool_dealer.send_multipart(msg)
+
+                        except Exception as exc:  # pylint: disable=broad-except
+                            log.error("Error routing request: %s", exc, exc_info=True)
+                            # Send error response back to client
+                            error_payload = salt.payload.dumps(
+                                {"error": "Routing error"}
                             )
-                            pool_name = next(iter(self.pool_workers.keys()))
+                            self.clients.send_multipart([msg[0], b"", error_payload])
 
-                        # Forward entire envelope to appropriate pool's DEALER
-                        # DEALER will preserve the envelope when forwarding to REQ workers
-                        pool_dealer = self.pool_workers[pool_name]
-                        pool_dealer.send_multipart(msg)
-
-                    except Exception as exc:  # pylint: disable=broad-except
-                        log.error("Error routing request: %s", exc, exc_info=True)
-                        # Send error response back to client
-                        error_payload = salt.payload.dumps({"error": "Routing error"})
-                        self.clients.send_multipart([msg[0], b"", error_payload])
-
-            except zmq.ZMQError as exc:
-                if exc.errno == errno.EINTR:
-                    continue
-                raise
-            except (KeyboardInterrupt, SystemExit):
-                break
-
-        # Cleanup
-        for pool_dealer in self.pool_workers.values():
-            pool_dealer.close()
-        # context.term()
+                except zmq.ZMQError as exc:
+                    if exc.errno == errno.EINTR:
+                        continue
+                    raise
+                except (KeyboardInterrupt, SystemExit):
+                    break
+        finally:
+            # Same rationale as zmq_device -- explicitly release sockets
+            # and the context so ``Context.__del__`` never has to.
+            # Sockets here have LINGER=1000/1 (finite) so close+term is safe.
+            for pool_dealer in self.pool_workers.values():
+                if not pool_dealer.closed:
+                    pool_dealer.close()
+            if not self.clients.closed:
+                self.clients.close()
+            context.term()
 
     def __setstate__(self, state):
         self.__init__(**state)
@@ -814,7 +836,18 @@ class RequestServer(salt.transport.base.DaemonizedRequestServer):
         if hasattr(self, "_socket") and self._socket.closed is False:
             self._socket.close()
         if hasattr(self, "context") and self.context.closed is False:
-            pass  # pass # self.context.term()
+            # ``self.context`` here is the ``zmq.asyncio.Context`` created
+            # in ``post_fork``.  Using ``destroy(linger=1000)`` rather
+            # than ``term()`` mirrors the discipline elsewhere in this
+            # module: ``term()`` has no timeout and can block
+            # indefinitely in ``zmq_ctx_term()`` if libzmq believes any
+            # socket still has queued undeliverable messages, whereas
+            # ``destroy(linger=N)`` explicitly caps the wait at ``N`` ms
+            # per socket.  1 s is enough to let any legitimate in-flight
+            # REP reply flush; the REP worker socket has already been
+            # closed above so in practice this returns immediately.
+            self.context.destroy(linger=1000)
+            self.context = None
         for task in list(self.tasks):
             try:
                 task.cancel()
@@ -1029,8 +1062,16 @@ class RequestServer(salt.transport.base.DaemonizedRequestServer):
 
             return self.decode_payload(reply)
         finally:
+            # This coroutine runs per forwarded message.  Without the
+            # explicit ``context.term()`` below, each call leaks a
+            # ``zmq.asyncio.Context`` -- eventually GC'd from an asyncio
+            # ioloop callback where ``Context.__del__`` -> ``destroy()``
+            # can wedge in ``zmq_ctx_term()`` if any socket still has
+            # queued undeliverable sends.  The REQ socket has LINGER=0
+            # so ``socket.close()`` above already dropped any pending
+            # send; the subsequent ``term()`` returns immediately.
             socket.close()
-            # context.term()
+            context.term()
 
 
 def _set_tcp_keepalive(zmq_socket, opts):
@@ -1218,7 +1259,21 @@ class AsyncReqMessageClient:
             self.socket.close(0)
             self.socket = None
         if self.context is not None and self.context.closed is False:
-            self.context.term()
+            # ``context.term()`` can block indefinitely in ``zmq_ctx_term()``
+            # if libzmq believes any socket on the context still has
+            # queued undeliverable messages -- even after we called
+            # ``socket.close(0)`` above.  Since we call this both from
+            # the explicit close path AND from ``_send_recv``'s timeout /
+            # reconnect branch (which runs on the owning ioloop), a block
+            # here freezes the ioloop.  ``destroy(linger=1000)`` bounds
+            # the wait: any socket the context still tracks gets a 1s
+            # grace to flush pending sends before terminating, so the
+            # call is bounded to O(sockets * 1s) and cannot wedge.  REQ
+            # semantics tolerate a bounded flush window -- unlike the
+            # PublishServer PUSH path which broke
+            # ``test_issue_regression_65265`` when destroyed with
+            # linger=0.
+            self.context.destroy(linger=1000)
             self.context = None
 
     def close_future(self):
@@ -1994,6 +2049,36 @@ class PublishServer(salt.transport.base.DaemonizedPublishServer):
         self.close()
 
 
+def _finalize_zmq_context(context):
+    """Bounded, wedge-safe zmq.Context teardown for ``weakref.finalize``.
+
+    Runs when a ``RequestClient`` (or similar owner) is garbage-collected
+    without an explicit ``close()`` having been called on it.  Explicitly
+    destroys the ``zmq.asyncio.Context`` with a bounded linger so
+    pyzmq's own ``Context.__del__`` -- which would otherwise walk the
+    context's sockets and call libzmq's ``zmq_ctx_term()`` under each
+    socket's native LINGER setting -- has nothing left to do.  That
+    matters because pyzmq's ``__del__`` runs synchronously on whatever
+    thread the last reference is dropped from, and when that thread is
+    an asyncio ioloop callback ``zmq_ctx_term()`` can block the whole
+    loop indefinitely.
+
+    Register from a ``RequestClient``-alike via::
+
+        weakref.finalize(self, _finalize_zmq_context, self.context)
+
+    ``weakref.finalize`` fires before the type slot ``__del__`` on the
+    referent runs and captures its own strong reference to ``context``,
+    so this callback is guaranteed to execute exactly once and to see a
+    live Context.
+    """
+    try:
+        if context is not None and not context.closed:
+            context.destroy(linger=1000)
+    except Exception:  # pylint: disable=broad-except
+        pass
+
+
 class RequestClient(salt.transport.base.RequestClient):
     ttype = "zeromq"
 
@@ -2058,6 +2143,19 @@ class RequestClient(salt.transport.base.RequestClient):
 
         if self.context is None:
             self.context = zmq.asyncio.Context()
+            # If a caller drops this RequestClient without invoking
+            # close(), pyzmq's own Context.__del__ walks the sockets
+            # and calls libzmq's zmq_ctx_term() under each socket's
+            # native LINGER -- from whatever thread the last reference
+            # is decremented on.  When that thread is an asyncio
+            # ioloop callback (RequestClient is created on such a
+            # callback via _fire_master_main -> _send_req_async_main
+            # -> req_channel.send -> transport.send -> connect() ->
+            # _init_socket, all on the ioloop), the loop freezes.
+            # ``weakref.finalize`` runs a bounded ``destroy(linger=N)``
+            # first, so pyzmq's ``__del__`` sees ``closed=True`` and
+            # skips the wedge-prone destroy path.
+            weakref.finalize(self, _finalize_zmq_context, self.context)
 
         self.socket = self.context.socket(zmq.REQ)
         self.socket.setsockopt(zmq.LINGER, 1)

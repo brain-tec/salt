@@ -464,11 +464,19 @@ def _terminate_subprocess_list(subprocess_list, signum, grace_seconds=2.0):
 
     if not salt.utils.platform.is_windows():
         for proc in procs:
+            # With ``multiprocessing: False`` the entries are
+            # ``threading.Thread`` objects, which have no ``pid`` and cannot be
+            # signalled.  Reading ``.pid`` there raises ``AttributeError``,
+            # which is not an ``OSError``, so it escaped and aborted the whole
+            # teardown before ``destroy()`` ever ran.
+            pid = getattr(proc, "pid", None)
+            if pid is None:
+                continue
             try:
-                os.kill(proc.pid, signum)
+                os.kill(pid, signum)
             except OSError as exc:
                 if exc.errno not in (errno.ESRCH, errno.EACCES):
-                    log.warning("Failed to signal job child pid %s: %s", proc.pid, exc)
+                    log.warning("Failed to signal job child pid %s: %s", pid, exc)
 
     deadline = time.time() + grace_seconds
     for proc in procs:
@@ -2301,6 +2309,7 @@ class Minion(MinionBase):
                 utils=self.utils,
                 notify=notify,
                 proxy=proxy,
+                loaded_base_name=self.loaded_base_name,
                 context=context,
             )
         returners = salt.loader.returners(opts, functions, proxy=proxy, context=context)
@@ -5443,6 +5452,7 @@ class Minion(MinionBase):
         if (
             tgt_type == "glob"
             and isinstance(tgt, str)
+            and tgt != self.opts.get("id")
             and not any(c in tgt for c in ("*", "?", "["))
         ):
             resources = self.opts.get("resources", {})

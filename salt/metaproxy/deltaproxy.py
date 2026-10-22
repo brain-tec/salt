@@ -60,6 +60,54 @@ from salt.utils.process import SignalHandlingProcess, default_signals
 log = logging.getLogger(__name__)
 
 
+def attach_req_channel(proxy_minion, proxy_opts, io_loop):
+    """
+    Give a sub-proxy its request channel, and the token that goes with it.
+
+    A sub-proxy is constructed directly rather than going through
+    ``connect_master``, which is where an ordinary minion picks up
+    ``self.tok``.  Without it every read of ``self.tok`` raises
+    ``AttributeError`` -- in practice from
+    ``_register_resources_with_master``, which ``pillar_refresh`` calls, so a
+    sub-proxy's resources never reach the master.  Derive the token from the
+    channel's auth the same way ``connect_master`` does.
+    """
+    proxy_minion.req_channel = salt.channel.client.AsyncReqChannel.factory(
+        proxy_opts, io_loop=io_loop
+    )
+    auth = getattr(proxy_minion.req_channel, "auth", None)
+    if auth is not None:
+        proxy_minion.tok = auth.gen_token(b"salt")
+    return proxy_minion.req_channel
+
+
+async def gather_subproxies(waitfor, ids):
+    """
+    Await every sub-proxy initialisation coroutine and return the results of
+    the ones that succeeded.
+
+    A sub-proxy that fails to initialise must not stop its siblings from
+    loading.  Without ``return_exceptions=True`` a single bad ``proxytype``
+    raises ``KeyError`` out of the proxy loader, propagates through
+    ``asyncio.gather``, and aborts the control proxy's ``post_master_init``,
+    which kills the salt-proxy daemon and takes every healthy sub-proxy down
+    with it.  The non-parallel startup path has always caught per sub-proxy
+    and carried on; this keeps the parallel path equivalent.
+    """
+    results = await asyncio.gather(*waitfor, return_exceptions=True)
+    collected = []
+    for _id, result in zip(ids, results):
+        if isinstance(result, BaseException):
+            log.error(
+                "An exception occured during initialization for %s, skipping: %s",
+                _id,
+                result,
+            )
+            continue
+        collected.append(result)
+    return collected
+
+
 async def post_master_init(self, master):
     """
     Function to finish init after a deltaproxy proxy
@@ -359,11 +407,7 @@ async def post_master_init(self, master):
                 )
             )
 
-        try:
-            results = await asyncio.gather(*waitfor)
-        except Exception as exc:  # pylint: disable=broad-except
-            log.error("Errors loading sub proxies: %s", exc)
-            raise
+        results = await gather_subproxies(waitfor, self.opts["proxy"].get("ids", []))
 
         _failed = self.opts["proxy"].get("ids", [])[:]
         for sub_proxy_data in results:
@@ -376,10 +420,10 @@ async def post_master_init(self, master):
                 self.deltaproxy_objs[minion_id] = sub_proxy_data["proxy_minion"]
 
                 if self.deltaproxy_opts[minion_id] and self.deltaproxy_objs[minion_id]:
-                    self.deltaproxy_objs[minion_id].req_channel = (
-                        salt.channel.client.AsyncReqChannel.factory(
-                            sub_proxy_data["proxy_opts"], io_loop=self.io_loop
-                        )
+                    attach_req_channel(
+                        self.deltaproxy_objs[minion_id],
+                        sub_proxy_data["proxy_opts"],
+                        self.io_loop,
                     )
     else:
         log.debug("Initiating non-parallel startup for proxies")
@@ -403,10 +447,10 @@ async def post_master_init(self, master):
                 self.deltaproxy_objs[minion_id] = sub_proxy_data["proxy_minion"]
 
                 if self.deltaproxy_opts[minion_id] and self.deltaproxy_objs[minion_id]:
-                    self.deltaproxy_objs[minion_id].req_channel = (
-                        salt.channel.client.AsyncReqChannel.factory(
-                            sub_proxy_data["proxy_opts"], io_loop=self.io_loop
-                        )
+                    attach_req_channel(
+                        self.deltaproxy_objs[minion_id],
+                        sub_proxy_data["proxy_opts"],
+                        self.io_loop,
                     )
 
     if _failed:
@@ -1195,15 +1239,34 @@ def threaded_subproxy_tune_in(proxy_minion):
     """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    return subproxy_tune_in(proxy_minion)
+    try:
+        return subproxy_tune_in(proxy_minion)
+    finally:
+        # The worker thread is about to go away.  Drop the throwaway loop
+        # instead of leaking its file descriptors for the life of the
+        # process, once per sub-proxy.
+        asyncio.set_event_loop(None)
+        loop.close()
 
 
 def subproxy_tune_in(proxy_minion, start=True):
     """
     Tunein sub proxy minions
     """
-    proxy_minion.setup_scheduler()
-    proxy_minion.setup_beacons()
-    proxy_minion.add_periodic_callback("cleanup", proxy_minion.cleanup_subprocesses)
+
+    def _start_periodics():
+        proxy_minion.setup_scheduler()
+        proxy_minion.setup_beacons()
+        proxy_minion.add_periodic_callback("cleanup", proxy_minion.cleanup_subprocesses)
+
+    # ``PeriodicCallback.start()`` binds to ``IOLoop.current()``.  Under
+    # ``parallel_startup`` this function runs on a ThreadPoolExecutor worker
+    # whose current loop is a throwaway that is never run, so starting the
+    # timers here would bind every one of them to a dead loop and the
+    # sub-proxy would silently get no schedule, no beacons and no subprocess
+    # cleanup.  Hand the registration to the sub-proxy's own io_loop -- the
+    # loop that is actually run -- via the thread-safe
+    # ``call_soon_threadsafe``, so the timers bind to that loop instead.
+    proxy_minion.io_loop.call_soon_threadsafe(_start_periodics)
     proxy_minion._state_run()
     return proxy_minion

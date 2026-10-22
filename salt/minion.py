@@ -4267,14 +4267,18 @@ class Minion(MinionBase):
         # Cache locally so :meth:`_resolve_resource_targets` can resolve
         # ``tgt_type == "grain"`` without re-rendering.
         self._resource_grains_cache = resource_grains
-        load = {
-            "cmd": "_register_resources",
-            "id": self.opts["id"],
-            "resources": resources,
-            "resource_grains": resource_grains,
-            "tok": self.tok,
-        }
         try:
+            # Build the load inside the guard as well: this method is
+            # best-effort, so a problem assembling the request should be
+            # reported the same way a failure to send it is, rather than
+            # escaping into pillar_refresh and aborting the rest of it.
+            load = {
+                "cmd": "_register_resources",
+                "id": self.opts["id"],
+                "resources": resources,
+                "resource_grains": resource_grains,
+                "tok": self.tok,
+            }
             await self._send_req_async_main(load, timeout=self._return_retry_timer())
             log.debug("Registered resources with master: %s", list(resources.keys()))
         except Exception as err:  # pylint: disable=broad-except
@@ -6488,6 +6492,27 @@ class ProxyMinion(Minion):
         """
         mp_call = _metaproxy_call(self.opts, "tune_in")
         return mp_call(self, start)
+
+    def destroy(self):
+        """
+        Tear down the proxy minion.
+
+        A deltaproxy holds its sub-proxies in ``deltaproxy_objs``, and each of
+        them owns its own ``req_channel``, schedule, beacons and periodic
+        callbacks.  Nothing used to tear those down, so every stop or restart
+        abandoned them.  Destroy the sub-proxies first, then this minion.
+        """
+        subproxies = getattr(self, "deltaproxy_objs", None) or {}
+        for minion_id, _minion in list(subproxies.items()):
+            try:
+                _minion.destroy()
+            except Exception:  # pylint: disable=broad-except
+                log.warning(
+                    "Unable to tear down sub proxy %s", minion_id, exc_info=True
+                )
+        if subproxies:
+            subproxies.clear()
+        super().destroy()
 
     def _target_load(self, load):
         """

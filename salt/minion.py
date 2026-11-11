@@ -16,6 +16,7 @@ import random
 import signal
 import stat
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -218,6 +219,48 @@ def _interruptible_sleep(duration, abort_event, chunk=1.0):
 # 6. Handle publications
 
 
+def _sync_grains(opts):
+    """
+    Sync custom grains from ``salt://_grains`` when the minion uses the local
+    file client.
+
+    Custom grains can be referenced from pillar, and pillar is compiled before
+    ``saltutil.sync_grains`` has had a chance to run, so without this the
+    custom grains are missing and pillar rendering fails. A minion that gets
+    its files from a master is not affected: the sync runs against the master
+    once the minion has connected.
+
+    Every environment in ``file_roots`` is synced, because the environments in
+    the top file cannot be known before pillar is available.
+
+    This only adds and updates grains. It never removes any, whatever
+    ``clean_dynamic_modules`` says: modules in ``extension_modules`` that are
+    not in ``file_roots`` (those shipped by salt-ssh, for example) are not ours
+    to delete implicitly at start-up.
+
+    The sync runs against a throwaway ``cachedir`` so that it leaves nothing
+    behind in the real one. The fileserver caches its file lists per
+    environment and backend, not per set of roots, so a list cached here could
+    later be served to something that reads the same ``cachedir`` with
+    different roots (``state.pkg`` on a salt-ssh target, for instance).
+
+    A failure here is logged and otherwise ignored so it cannot prevent the
+    minion from starting.
+    """
+    if opts.get("file_client", "remote") != "local":
+        return
+
+    file_roots = opts.get("file_roots") or {}
+    saltenv = ["base"] + sorted(env for env in file_roots if env != "base")
+    try:
+        with tempfile.TemporaryDirectory(prefix="salt-grains-sync-") as cachedir:
+            sync_opts = opts.copy()
+            sync_opts["cachedir"] = cachedir
+            salt.utils.extmods.sync(sync_opts, "grains", saltenv=saltenv, clean=False)
+    except Exception as exc:  # pylint: disable=broad-except
+        log.error("Failed to sync custom grains: %s", exc)
+
+
 def resolve_dns(opts, fallback=True):
     """
     Resolves the master_ip and master_uri options
@@ -302,7 +345,10 @@ def resolve_dns(opts, fallback=True):
 
     if "master_ip" in ret and "master_ip" in opts:
         if ret["master_ip"] != opts["master_ip"]:
-            log.warning(
+            # DNS-driven master IP updates are the intended behavior of
+            # ``master_alive_interval``; log as INFO rather than WARNING
+            # so operators are not alerted on normal failover activity.
+            log.info(
                 "Master ip address changed from %s to %s",
                 opts["master_ip"],
                 ret["master_ip"],
@@ -1243,7 +1289,10 @@ class MinionBase:
                 # If failover is set, minion have to failover on DNS errors instead of retry DNS resolve.
                 # See issue 21082 for details
                 if opts["retry_dns"] and opts["master_type"] == "failover":
-                    log.critical(
+                    # Auto-correcting a config knob is informational, not a
+                    # critical failure; operators scanning for CRITICAL lines
+                    # should not be paged for a helpful default fix-up.
+                    log.info(
                         "'master_type' set to 'failover' but 'retry_dns' is not 0."
                         " Setting 'retry_dns' to 0 to failover to the next master on"
                         " DNS errors."
@@ -1559,6 +1608,7 @@ class SMinion(MinionBase):
         # We need to call super().__init__ first to get the OptsDict conversion
         super().__init__(opts)
 
+        _sync_grains(self.opts)
         new_grains = salt.loader.grains(self.opts)
         self.opts.mutate_key("grains", new_grains)
 
@@ -1826,10 +1876,30 @@ class MinionManager(MinionBase):
         except RuntimeError:
             self.io_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.io_loop)
+        # Hold strong references to every background task spawned on this
+        # loop. Without them the ``asyncio`` module-level ``WeakSet`` is the
+        # only reference to the Task object, which lets CPython's garbage
+        # collector destroy pending Tasks mid-``await`` and emit
+        # ``Task was destroyed but it is pending!`` -- see the same comment
+        # on ``Minion._spawn_background``. Siblings of #70733 (SIGTERM-time
+        # drains); this one covers the bootstrap / retry-loop sites. #70748.
+        self._background_tasks = set()
         self.process_manager = ProcessManager(name="MultiMinionProcessManager")
-        self.io_loop.create_task(self.process_manager.run(asynchronous=True))
+        self._spawn_background(self.process_manager.run(asynchronous=True))
         self.event_publisher = None
         self.event = None
+
+    def _spawn_background(self, coro):
+        """
+        Schedule a fire-and-forget coroutine on ``self.io_loop`` while
+        keeping a strong reference to the resulting :class:`asyncio.Task`
+        until it completes. See ``Minion._spawn_background`` for the
+        rationale (identical bug class). #70748.
+        """
+        task = self.io_loop.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     # pylint: disable=W1701
     def __del__(self):
@@ -1840,7 +1910,7 @@ class MinionManager(MinionBase):
     def _bind(self):
         # start up the event publisher, so we can see events during startup
         self.event_publisher = salt.transport.ipc_publish_server("minion", self.opts)
-        self.io_loop.create_task(
+        self._spawn_background(
             self.event_publisher.publisher(
                 self.event_publisher.publish_payload,
                 io_loop=self.io_loop,
@@ -1870,6 +1940,30 @@ class MinionManager(MinionBase):
                 if hasattr(minion, "destroy"):
                     minion.destroy()
             self.minions = []
+        # Cancel any still-pending background tasks we spawned.  Without
+        # this, a background Task that never got scheduled (loop never
+        # ran, e.g., in unit tests that construct + destroy without
+        # driving the loop) would be GC'd pending and asyncio would
+        # emit ``Task was destroyed but it is pending!`` -- exactly the
+        # signature #70748 fixes elsewhere.  Cancelling closes the
+        # underlying coroutine so no RuntimeWarning fires either.
+        bg = getattr(self, "_background_tasks", None)
+        if bg:
+            for task in list(bg):
+                if not task.done():
+                    try:
+                        task.cancel()
+                    except RuntimeError:
+                        # Loop already closed; coroutine may still be
+                        # pending.  Close it so Python doesn't emit the
+                        # "coroutine was never awaited" RuntimeWarning.
+                        coro = getattr(task, "get_coro", lambda: None)()
+                        if coro is not None:
+                            try:
+                                coro.close()
+                            except Exception:  # pylint: disable=broad-except
+                                pass
+            bg.clear()
         # Close the local event publisher and event bus.  ``stop_async``
         # (invoked from the SIGTERM signal handler) already does this,
         # but ``destroy`` is *also* reached from
@@ -1960,7 +2054,7 @@ class MinionManager(MinionBase):
                 loaded_base_name="salt.loader.{}".format(s_opts["master"]),
                 jid_queue=self.jid_queue,
             )
-            self.io_loop.create_task(self._connect_minion(minion))
+            self._spawn_background(self._connect_minion(minion))
         self.io_loop.call_later(timeout, self._check_minions)
 
     async def _connect_minion(self, minion):
@@ -1981,14 +2075,40 @@ class MinionManager(MinionBase):
                 break
             except SaltClientError as exc:
                 minion.destroy()
+                # ``destroy()`` flips ``_running`` to ``False``; without
+                # resetting it the next (successful) ``tune_in(start=False)``
+                # call would fall into the "scheduled to stop" branch in
+                # ``_pre_tune`` and return without binding this master.
+                minion._running = None
                 failed = True
-                log.error(
-                    "Error while bringing up minion for multi-master. Is "
-                    "master at %s responding? The error message was %s",
-                    minion.opts["master"],
-                    exc,
-                    exc_info=True,
-                )
+                # ``SaltClientError`` re-raised from the pillar channel after
+                # a ``cluster_retry`` deferral wraps the original
+                # ``AuthenticationError`` whose message carries the sentinel
+                # suffix (see ``salt.channel.client.CLUSTER_NOT_READY_SUFFIX``).
+                # Suppress the noisy ERROR + traceback for that transient
+                # cluster-not-ready case — the loop retries on its own.  Any
+                # other ``SaltClientError`` keeps the existing ERROR path.
+                cause = exc.__cause__
+                if (
+                    cause is not None
+                    and salt.channel.client._is_cluster_not_ready_message(
+                        getattr(cause, "message", None)
+                    )
+                ):
+                    log.info(
+                        "Master %s is still catching up (cluster not "
+                        "ready); retrying in %ss",
+                        minion.opts["master"],
+                        auth_wait,
+                    )
+                else:
+                    log.error(
+                        "Error while bringing up minion for multi-master. Is "
+                        "master at %s responding? The error message was %s",
+                        minion.opts["master"],
+                        exc,
+                        exc_info=True,
+                    )
                 last = time.time()
                 if auth_wait < self.max_auth_wait:
                     auth_wait += self.auth_wait
@@ -2237,7 +2357,7 @@ class Minion(MinionBase):
             time.sleep(sleep_time)
 
         self.process_manager = ProcessManager(name="MinionProcessManager")
-        self.io_loop.create_task(self.process_manager.run(asynchronous=True))
+        self._spawn_background(self.process_manager.run(asynchronous=True))
         # We don't have the proxy setup yet, so we can't start engines
         # Engines need to be able to access __proxy__
         if not salt.utils.platform.is_proxy():
@@ -3171,7 +3291,7 @@ class Minion(MinionBase):
             return
 
         self._process_queue_processing_active = True
-        self.io_loop.create_task(self._process_process_queue_async())
+        self._spawn_background(self._process_process_queue_async())
 
     async def _process_process_queue_async(self):
         """
@@ -3319,7 +3439,7 @@ class Minion(MinionBase):
 
                         log.info("Re-submitting queued job %s", data.get("jid"))
 
-                        self.io_loop.create_task(self._handle_decoded_payload(data))
+                        self._spawn_background(self._handle_decoded_payload(data))
 
                         # Remove from queue
                         try:
@@ -4438,7 +4558,7 @@ class Minion(MinionBase):
                 else:
                     data["fun"] = "state.highstate"
                     data["arg"] = []
-                self.io_loop.create_task(self._handle_decoded_payload(data))
+                self._spawn_background(self._handle_decoded_payload(data))
 
     def _refresh_grains_watcher(self, refresh_interval_in_minutes):
         """
@@ -5402,7 +5522,7 @@ class Minion(MinionBase):
             return
 
         self._state_queue_processing_active = True
-        self.io_loop.create_task(self._process_state_queue_async())
+        self._spawn_background(self._process_state_queue_async())
 
     async def _process_state_queue_async(self):
         """
@@ -5672,7 +5792,7 @@ class Minion(MinionBase):
                                     "minion is running under an init system."
                                 )
 
-                    self.io_loop.create_task(
+                    self._spawn_background(
                         self._fire_master_main(
                             "ping",
                             "minion_ping",
@@ -6134,6 +6254,26 @@ class Minion(MinionBase):
         if hasattr(self, "process_manager") and self.process_manager is not None:
             self.process_manager.stop_restarting()
             self.process_manager.kill_children()
+        # Cancel any still-pending background tasks spawned via
+        # ``_spawn_background``.  Without this, a strong-referenced Task
+        # that never got scheduled (loop never ran, e.g., short-lived
+        # unit tests) would be GC'd pending with the asyncio
+        # "Task was destroyed but it is pending!" warning -- exactly
+        # the signature #70748 fixes elsewhere.
+        bg = getattr(self, "_background_tasks", None)
+        if bg:
+            for task in list(bg):
+                if not task.done():
+                    try:
+                        task.cancel()
+                    except RuntimeError:
+                        coro = getattr(task, "get_coro", lambda: None)()
+                        if coro is not None:
+                            try:
+                                coro.close()
+                            except Exception:  # pylint: disable=broad-except
+                                pass
+            bg.clear()
         if hasattr(self, "schedule"):
             del self.schedule
         if hasattr(self, "pub_channel") and self.pub_channel is not None:
@@ -6419,6 +6559,23 @@ class SyndicManager(MinionBase):
         self.pub_futures = {}
         # Local client (set in tune_in())
         self.local = None
+        # Hold strong references to fire-and-forget tasks so CPython's
+        # garbage collector doesn't destroy them mid-``await`` -- see
+        # ``Minion._spawn_background`` and ``MinionManager._spawn_background``
+        # for the identical bug class. #70748.
+        self._background_tasks = set()
+
+    def _spawn_background(self, coro):
+        """
+        Schedule a fire-and-forget coroutine on ``self.io_loop`` while
+        keeping a strong reference to the resulting :class:`asyncio.Task`
+        until it completes. See ``Minion._spawn_background`` for the
+        rationale. #70748.
+        """
+        task = self.io_loop.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     def _spawn_syndics(self):
         """
@@ -6441,7 +6598,7 @@ class SyndicManager(MinionBase):
                 except Exception as exc:  # pylint: disable=broad-except
                     future.set_exception(exc)
 
-            self.io_loop.create_task(connect(future, s_opts))
+            self._spawn_background(connect(future, s_opts))
 
     async def _connect_syndic(self, opts):
         """
@@ -6470,11 +6627,34 @@ class SyndicManager(MinionBase):
                 break
             except SaltClientError as exc:
                 failed = True
-                log.error(
-                    "Error while bringing up syndic for multi-syndic. Is the "
-                    "master at %s responding?",
-                    opts["master"],
-                )
+                # ``SaltClientError`` re-raised from ``compile_pillar`` after a
+                # ``cluster_retry`` deferral wraps the original
+                # ``AuthenticationError`` whose message carries the
+                # cluster-not-ready sentinel (see
+                # ``salt.channel.client.CLUSTER_NOT_READY_SUFFIX``).  Suppress
+                # the noisy ERROR for that transient cluster-not-ready case —
+                # the syndic connect loop retries on its own.  Any other
+                # ``SaltClientError`` keeps the existing ERROR path.  Mirrors
+                # the demotion applied in ``MinionManager._connect_minion``.
+                cause = exc.__cause__
+                if (
+                    cause is not None
+                    and salt.channel.client._is_cluster_not_ready_message(
+                        getattr(cause, "message", None)
+                    )
+                ):
+                    log.info(
+                        "Syndic master %s is still catching up (cluster "
+                        "not ready); retrying in %ss",
+                        opts["master"],
+                        auth_wait,
+                    )
+                else:
+                    log.error(
+                        "Error while bringing up syndic for multi-syndic. Is the "
+                        "master at %s responding?",
+                        opts["master"],
+                    )
                 last = time.time()
                 if auth_wait < self.max_auth_wait:
                     auth_wait += self.auth_wait
@@ -6773,6 +6953,22 @@ class SyndicManager(MinionBase):
         if hasattr(self, "mminion") and self.mminion is not None:
             self.mminion.destroy()
             self.mminion = None
+        # Same rationale as ``Minion.destroy`` / ``MinionManager.destroy``
+        # for the background-task cleanup; see #70748.
+        bg = getattr(self, "_background_tasks", None)
+        if bg:
+            for task in list(bg):
+                if not task.done():
+                    try:
+                        task.cancel()
+                    except RuntimeError:
+                        coro = getattr(task, "get_coro", lambda: None)()
+                        if coro is not None:
+                            try:
+                                coro.close()
+                            except Exception:  # pylint: disable=broad-except
+                                pass
+            bg.clear()
 
 
 class ProxyMinionManager(MinionManager):

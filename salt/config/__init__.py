@@ -230,6 +230,19 @@ VALID_OPTS = immutabletypes.freeze(
         # and can be sync'd as opaque blobs) and joining masters request a
         # bulk state-sync from an existing peer before becoming Raft voters.
         "cluster_isolated_filesystem": bool,
+        # Receiver-side founder-wait window applied by the unified
+        # cluster-key propagation state machine
+        # (``salt/channel/_cluster_key_state.py``).  When a master in
+        # BOOTSTRAP state for ``cluster_aes`` or ``cluster.pem`` receives
+        # a join-reply whose sender is NOT the designated cluster founder,
+        # it defers the install for up to this many seconds to give the
+        # founder's reply time to arrive.  Past the window the receiver
+        # commits to whichever non-founder install lands next (with a
+        # WARN) so a founder-dead late-joiner can still converge.  A
+        # value of ``0.0`` disables the window (any first arrival wins
+        # BOOTSTRAP commit).  See reviewer tweak T-1 in
+        # ``agents/reports/design-unified-cluster-key-propagation-reviewer.md``.
+        "cluster_bootstrap_founder_wait_s": float,
         # Master switch for cross-master cache replication at the
         # ``salt.cache.Cache`` facade.  When True (the default when
         # ``cluster_id`` is set and ``cluster_isolated_filesystem`` is True)
@@ -439,11 +452,16 @@ VALID_OPTS = immutabletypes.freeze(
         "disable_modules": list,
         # Refuse to load these returners
         "disable_returners": list,
-        # Tell the loader to only load modules in this list
+        # Tell the loader to only load modules in this list.  Entries are
+        # either a bare module name (``cmd`` -- every public function of
+        # the module is allowed) or a function-scoped ``module.func``
+        # (``cmd.run`` -- only that function).  A ``module.func`` entry
+        # always narrows: ``[cmd, cmd.run]`` allows only ``cmd.run``.
         "whitelist_modules": list,
         # State-loader counterpart to ``whitelist_modules``.  When set,
-        # only state modules whose name is in this list are loadable; an
-        # SLS that references any other state module fails compile with
+        # only state modules (or specific state functions, using the
+        # ``state.func`` form) whose name is in this list are loadable;
+        # an SLS that references a disallowed state fails compile with
         # ``State '<mod>.<fun>' was not found in SLS ...``.
         "whitelist_state_modules": list,
         # A list of additional directories to search for salt modules in
@@ -2082,6 +2100,13 @@ DEFAULT_MASTER_OPTS = immutabletypes.freeze(
         "cluster_pub_fingerprint": None,
         "cluster_secret": None,
         "cluster_isolated_filesystem": False,
+        # Default founder-wait window for the unified cluster-key
+        # propagation state machine.  Reviewer T-1: 2.0s is large
+        # enough to dominate the observed arm64 CI race window
+        # (588ms-12s) without blocking late-joiners when the founder
+        # is dead.  Operators can lower to 0.0 for testing or raise
+        # for slow runners.
+        "cluster_bootstrap_founder_wait_s": 2.0,
         # ``cluster_cache_replication`` default is resolved in
         # ``apply_master_config`` because it depends on whether
         # ``cluster_id`` is configured and whether the deployment is

@@ -1448,7 +1448,7 @@ def _ip_addrs(
     interface=None, include_loopback=False, interface_data=None, proto="inet"
 ):
     """
-    Return the full list of IP adresses matching the criteria
+    Return the full list of IP addresses matching the criteria
 
     proto = inet|inet6
     """
@@ -2508,6 +2508,27 @@ def slaac(value, mac):
     eui64 = bytes([mac_bytes[0] ^ 0x02]) + mac_bytes[1:3] + b"\xff\xfe" + mac_bytes[3:]
     interface_id = int.from_bytes(eui64, "big")
     return str(ipaddress.IPv6Address(int(network.network_address) | interface_id))
+
+
+def nm_managed():
+    """
+    Return ``True`` when this host is managed by NetworkManager without the
+    legacy ``network-scripts`` tooling: ``nmcli`` is on ``PATH``, NetworkManager
+    is running (``/run/NetworkManager`` exists) and neither ``ifup`` nor
+    ``ifdown`` is available.
+
+    This is the load-time-safe condition that decides whether the
+    :py:mod:`nm_ip <salt.modules.nm_ip>` or :py:mod:`rh_ip
+    <salt.modules.rh_ip>` execution module owns the ``ip`` provider on the
+    RedHat os_family. Both modules call this single helper from their
+    ``__virtual__`` so exactly one of them claims ``ip`` and no runtime service
+    call is needed.
+    """
+    return (
+        bool(salt.utils.path.which("nmcli"))
+        and os.path.isdir("/run/NetworkManager")
+        and not (salt.utils.path.which("ifup") or salt.utils.path.which("ifdown"))
+    )
 
 
 def neigh_expand_warning(func_name, expand):

@@ -21,7 +21,6 @@ import salt.utils.args
 import salt.utils.crypt
 import salt.utils.data
 import salt.utils.dictupdate
-import salt.utils.master
 import salt.utils.secret
 import salt.utils.url
 from salt.exceptions import SaltClientError
@@ -1464,6 +1463,10 @@ class Pillar:
 # TODO: actually migrate from Pillar to AsyncPillar to allow for futures in
 # ext_pillar etc.
 class AsyncPillar(Pillar):
+    async def aclose(self):
+        """Async-aware teardown."""
+        self.destroy()
+
     async def compile_pillar(
         self, ext=True
     ):  # pylint: disable=invalid-overridden-method

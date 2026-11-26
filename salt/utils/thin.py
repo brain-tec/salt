@@ -251,6 +251,12 @@ def _add_dependency(container, obj, namespace=None):
     :param namespace: Optional tuple of parent namespaces for namespace packages
     :return:
     """
+    if getattr(obj, "__file__", None) is None:
+        # Some packages have no __init__.py, so we cannot use __file__
+        for path in getattr(obj, "__path__", []):
+            if (path, namespace) not in container:
+                container.append((path, namespace))
+        return
     if os.path.basename(obj.__file__).split(".")[0] == "__init__":
         container.append((os.path.dirname(obj.__file__), namespace))
     else:
@@ -511,7 +517,7 @@ def _get_supported_py_config(tops, extended_cfg):
     :return:
     """
     pymap = []
-    for py_ver, tops in copy.deepcopy(tops).items():
+    for py_ver in copy.deepcopy(tops):
         py_ver = int(py_ver)
         if py_ver == 2:
             pymap.append("py2:2:7")

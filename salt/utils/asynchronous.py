@@ -9,6 +9,7 @@ import logging
 import os
 import sys
 import threading
+import time
 import types
 
 import tornado.concurrent
@@ -33,6 +34,80 @@ def aioloop(io_loop, warn=False):
         return io_loop.asyncio_loop
     else:
         raise RuntimeError("Loop must be AbstractEventLoop (prefered) or IOLoop")
+
+
+async def _wait_for_unwinding_tasks(roots, timeout):
+    """
+    Wait until every task that is one of ``roots`` or has been asked to cancel
+    (by anyone) has finished.  Return the ones that are left after ``timeout``.
+    """
+    deadline = time.monotonic() + timeout
+    seen = set(roots)
+    while True:
+        pending = [
+            task
+            for task in asyncio.all_tasks()
+            if not task.done() and (task in roots or task.cancelling())
+        ]
+        seen.update(pending)
+        remaining = deadline - time.monotonic()
+        if not pending or remaining <= 0:
+            for task in seen:
+                # A task whose cleanup failed has an exception that nobody
+                # retrieves, so asyncio would log "Task exception was never
+                # retrieved" at shutdown.  Looking at it marks it as retrieved.
+                if task.done() and not task.cancelled():
+                    task.exception()
+            return pending
+        await asyncio.wait(pending, timeout=remaining)
+
+
+def cancel_and_drain(loop, tasks, timeout=5.0):
+    """
+    Cancel ``tasks`` and run ``loop`` until they, and every other task that has
+    been asked to cancel, have finished, or until ``timeout`` seconds have
+    passed.
+
+    Call it right before ``loop.close()``.  A cancelled task only unwinds
+    (``finally`` blocks, ``async with`` exits, closing its sockets) while the
+    loop keeps running.  A loop that is closed straight after the cancel
+    leaves such a task suspended with its resources still open, and the
+    garbage collector later blocks in ``zmq_ctx_term()`` waiting for a
+    socket that nobody can close any more.
+
+    Only ``tasks`` are cancelled here.  Cancelling one of them can make code
+    cancel others, for example a done callback that cancels the sign-in task
+    when its last caller goes away.  Those tasks are waited for as well.
+    Tasks that nobody asked to cancel are left alone, because the code that
+    owns them may still close them later and expect them not to be cancelled.
+
+    ``loop`` must not be running, so this is meant for the code that owns
+    the loop and has just left ``run_forever()``.  A loop that is closed or
+    running is left alone.
+
+    The time limit only helps with tasks that wait for something that never
+    comes.  It cannot interrupt a task that blocks the thread.
+
+    Tasks that are still unfinished when the time runs out are logged as a
+    warning.
+
+    :param loop: the event loop that is about to be closed
+    :param tasks: the tasks to cancel
+    :param float timeout: seconds to wait for the tasks to finish
+    """
+    if loop is None or loop.is_closed() or loop.is_running():
+        return
+    roots = {task for task in tasks if not task.done()}
+    for task in roots:
+        task.cancel()
+    pending = loop.run_until_complete(_wait_for_unwinding_tasks(roots, timeout))
+    if pending:
+        log.warning(
+            "%d task(s) did not finish within %s seconds of being cancelled: %s",
+            len(pending),
+            timeout,
+            ", ".join(repr(task) for task in pending),
+        )
 
 
 @contextlib.contextmanager
@@ -350,6 +425,10 @@ class SyncWrapper:
         types.MethodType,
         types.BuiltinMethodType,
     )
+    if hasattr(asyncio, "Timeout"):
+        # A timeout context retains the current task while it waits, but does
+        # not make an otherwise abandoned task user-owned.
+        _ORPHAN_TASK_REFERRER_TYPES += (asyncio.Timeout,)
 
     @classmethod
     def _task_is_orphan(cls, task, exclude):
@@ -366,6 +445,17 @@ class SyncWrapper:
         for ref in gc.get_referrers(task):
             if id(ref) in exclude:
                 continue
+            if isinstance(ref, dict):
+                # CPython may expose an attribute through the instance's
+                # dictionary rather than the instance itself. Such a task is
+                # still owned; dispatch bookkeeping dictionaries are not.
+                for owner in gc.get_referrers(ref):
+                    if id(owner) in exclude or isinstance(
+                        owner, cls._ORPHAN_TASK_REFERRER_TYPES
+                    ):
+                        continue
+                    if getattr(owner, "__dict__", None) is ref:
+                        return False
             if isinstance(ref, cls._ORPHAN_TASK_REFERRER_TYPES):
                 continue
             # ``TaskStepMethWrapper`` is a C-level asyncio internal used
@@ -389,6 +479,19 @@ class SyncWrapper:
             pre_existing = set(asyncio.all_tasks(asyncio_loop))
         except RuntimeError:
             pre_existing = set()
+        previous_factory = asyncio_loop.get_task_factory()
+        task_parents = {}
+
+        def track_task(loop, coro, **kwargs):
+            parent = asyncio.current_task(loop=loop)
+            if previous_factory is None:
+                task = asyncio.Task(coro, loop=loop, **kwargs)
+            else:
+                task = previous_factory(loop, coro, **kwargs)
+            task_parents[task] = parent
+            return task
+
+        asyncio_loop.set_task_factory(track_task)
         try:
             result = io_loop.run_sync(lambda: getattr(self.obj, key)(*args, **kwargs))
             results.append(True)
@@ -397,6 +500,7 @@ class SyncWrapper:
             results.append(False)
             results.append(sys.exc_info())
         finally:
+            asyncio_loop.set_task_factory(previous_factory)
             # Reap ``asyncio.Task`` objects the wrapped coroutine scheduled
             # on ``asyncio_loop`` but did not await -- e.g. pyzmq's
             # future-based sockets and tornado's asyncio bridge fire tasks
@@ -429,11 +533,26 @@ class SyncWrapper:
                     ]
                     if new_tasks:
                         exclude = {id(new_tasks), id(current), id(pre_existing)}
-                        orphans = [
+                        owned = pre_existing | {
                             task
                             for task in new_tasks
-                            if self._task_is_orphan(task, exclude)
-                        ]
+                            if not self._task_is_orphan(task, exclude)
+                        }
+                        # wait_for(), gather(), and shield() can create child
+                        # tasks with no direct user-object reference. Preserve
+                        # descendants of retained workers as well as the
+                        # workers themselves. Track creation rather than
+                        # relying on private asyncio waiter/callback layouts.
+                        while True:
+                            children = {
+                                task
+                                for task, parent in task_parents.items()
+                                if parent in owned and task not in owned
+                            }
+                            if not children:
+                                break
+                            owned.update(children)
+                        orphans = [task for task in new_tasks if task not in owned]
                         if orphans:
                             for task in orphans:
                                 task.cancel()

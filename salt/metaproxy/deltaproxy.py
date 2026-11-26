@@ -124,6 +124,7 @@ async def post_master_init(self, master):
             self.opts["id"],
             saltenv=self.opts["saltenv"],
             pillarenv=self.opts.get("pillarenv"),
+            snapshot=True,
         ).compile_pillar()
 
         # Ensure that the value of master is the one we passed in.
@@ -475,6 +476,10 @@ async def post_master_init(self, master):
 
     if _failed:
         log.error("The following sub proxies failed to initialize: %s", _failed)
+    if self.opts.get("transport", "zeromq") == "zeromq" and self.opts.get(
+        "zmq_filtering"
+    ):
+        self.pub_channel.transport.add_subscriptions(list(self.deltaproxy_objs))
     self.ready = True
 
 
@@ -511,6 +516,7 @@ async def subproxy_post_master_init(minion_id, uid, opts, main_proxy, main_utils
         minion_id,
         saltenv=proxyopts["saltenv"],
         pillarenv=proxyopts.get("pillarenv"),
+        snapshot=True,
     ).compile_pillar()
 
     proxyopts["proxy"] = proxy_pillar.get("proxy", {})
@@ -574,8 +580,13 @@ async def subproxy_post_master_init(minion_id, uid, opts, main_proxy, main_utils
     # Create this after modules are synced to ensure
     # any custom modules, eg. custom proxy modules
     # are avaiable.
+    # Proxy modules keep device connections in globals, so they need the
+    # same per-sub-proxy namespace as the execution modules. See #70760.
     _proxy_minion.proxy = salt.loader.proxy(
-        proxyopts, utils=main_utils, context=proxy_context
+        proxyopts,
+        utils=main_utils,
+        context=proxy_context,
+        loaded_base_name=_proxy_minion.loaded_base_name,
     )
 
     _proxy_minion.functions.pack["__proxy__"] = _proxy_minion.proxy

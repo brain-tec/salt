@@ -134,7 +134,16 @@ def dict_merge(a, b, path=None):
             else:
                 a[key] = b[key]
         else:
-            a[key] = b[key]
+            # Key is absent from a. Descend into dicts so nested override
+            # markers are still processed, and honour a leading '^' marker on
+            # a list even when there is no existing list to override.
+            if isinstance(b[key], list) and b[key] and b[key][0] == "^":
+                a[key] = b[key][1:]
+            elif isinstance(b[key], dict):
+                a[key] = {}
+                dict_merge(a[key], b[key], path + [str(key)])
+            else:
+                a[key] = b[key]
     return a
 
 
@@ -318,7 +327,13 @@ def expand_classes_in_order(minion_dict, salt_data, seen_classes, classes_to_exp
             # Merge newly found pillars into existing ones
             new_pillars = klass_dict[klass].get("pillars", {})
             if new_pillars:
-                dict_merge(salt_data["__pillar__"], new_pillars)
+                # Deepcopy so salt_data["__pillar__"] gets its own copy of the
+                # class's pillars. dict_merge stores lists from new_pillars in
+                # __pillar__ by reference and later extends them in place, which
+                # would also change the class's own lists. The final merge
+                # (in expanded_dict_from_minion) reads those same class dicts from
+                # expanded_classes, so it would then see duplicated entries.
+                dict_merge(salt_data["__pillar__"], copy.deepcopy(new_pillars))
 
             if "classes" in klass_dict[klass]:
                 nested_classes = expand_classes_in_order(

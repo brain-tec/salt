@@ -37,10 +37,6 @@ def process_manager():
         _process_manager.terminate()
 
 
-@pytest.mark.skipif(
-    "grains['osfinger'] == 'Rocky Linux-8' and grains['osarch'] == 'aarch64'",
-    reason="Temporarily skip on Rocky Linux 8 Arm64",
-)
 def test_process_manager_60749(process_manager):
     """
     Regression test for issue #60749
@@ -124,6 +120,89 @@ def test_subprocess_list_fds():
         f"Popen sentinel fd {sentinel} still points at the same pipe "
         f"({sentinel_target!r}) after SubprocessList.cleanup()"
     )
+
+
+def _sleep_target(seconds):
+    """Module-level target so the test works under spawn/forkserver too."""
+    import time as _time
+
+    _time.sleep(seconds)
+
+
+def _exit_immediately_target():
+    """Module-level target that returns immediately."""
+
+
+def test_subprocess_list_cleanup_does_not_block_on_live_processes():
+    """
+    Regression: cleanup() previously called proc.join(0.01) on every
+    entry including live ones, costing up to 10ms per live child inside
+    the minion's 200ms periodic cleanup callback. With N live children
+    this starved the ioloop. The current cleanup must skip live
+    processes entirely and return near-instantly regardless of N.
+    """
+    import multiprocessing
+
+    # Use a reasonably large N so the old 10ms-per-proc bound is
+    # clearly violated if the regression returns.
+    N = 50
+    sublist = salt.utils.process.SubprocessList()
+    procs = []
+    try:
+        for _ in range(N):
+            p = multiprocessing.Process(target=_sleep_target, args=(30,))
+            p.start()
+            sublist.add(p)
+            procs.append(p)
+
+        # All children are alive; cleanup should be a no-op reap pass
+        # that returns near-instantly.
+        start = time.monotonic()
+        sublist.cleanup()
+        elapsed = time.monotonic() - start
+
+        # Old code: up to N * 10ms = 500ms. Give CI generous headroom
+        # but still catch the regression.
+        assert elapsed < 0.2, (
+            f"cleanup() took {elapsed:.3f}s with {N} live children; "
+            "regression -- it must not block on live processes."
+        )
+        # Live children were NOT removed from the list.
+        assert sublist.count == N
+        assert len(sublist.processes) == N
+    finally:
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+        for p in procs:
+            p.join(timeout=5)
+
+
+def test_subprocess_list_cleanup_reaps_dead_processes():
+    """
+    Companion to ``test_subprocess_list_cleanup_does_not_block_on_live_processes``:
+    guard against the non-blocking fix accidentally skipping the reap of
+    an already-exited child. A process whose target has returned must be
+    removed from the SubprocessList on the next ``cleanup()`` call.
+    """
+    import multiprocessing
+
+    sublist = salt.utils.process.SubprocessList()
+    p = multiprocessing.Process(target=_exit_immediately_target)
+    p.start()
+    sublist.add(p)
+    assert sublist.count == 1
+
+    # Wait for the child to actually exit so is_alive() flips to False.
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and p.is_alive():
+        time.sleep(0.01)
+    assert not p.is_alive(), "child did not exit within 5s"
+
+    sublist.cleanup()
+
+    assert sublist.count == 0
+    assert sublist.processes == []
 
 
 def test_process_preimports_multiprocessing_connection_68573(tmp_path):
@@ -429,3 +508,63 @@ def test_handle_signals_default_int_handler_typeerror():
     # KeyboardInterrupt (what Python does natively on SIGINT).
     with pytest.raises(KeyboardInterrupt):
         pm._handle_signals(signal.SIGTERM, None)
+
+
+class _PickleRoundTripProcess(salt.utils.process.SignalHandlingProcess):
+    """Used by ``test_setstate_reseeds_args_for_second_generation_pickle``.
+
+    Needs two required positional args so a lossy ``__setstate__`` fails
+    loudly with ``TypeError`` instead of silently constructing a broken
+    instance.
+    """
+
+    def __init__(self, opts, ipc_publisher, **kwargs):
+        super().__init__(**kwargs)
+        self.opts = opts
+        self.ipc_publisher = ipc_publisher
+
+    def run(self):
+        pass
+
+
+def test_setstate_reseeds_args_for_second_generation_pickle():
+    """Regression: a ``Process`` object must round-trip through pickle
+    repeatedly without losing its constructor args.
+
+    Pickle's default unpickle flow calls ``cls.__new__(cls)`` with no
+    arguments, so the ``_args_for_getstate`` / ``_kwargs_for_getstate``
+    attributes that ``Process.__new__`` normally captures are empty on
+    the unpickled instance.  ``Process.__setstate__`` then rebuilds state
+    via ``self.__init__(*args, **kwargs)``, but prior to the fix did NOT
+    re-seed ``_args_for_getstate`` / ``_kwargs_for_getstate`` on the
+    reconstructed instance.  The next pickle (second-generation --- when
+    a child process spawns a grandchild via its own ``ProcessManager``)
+    would emit an empty args tuple, and the grandchild's
+    ``__setstate__`` would call ``self.__init__()`` with no positional
+    args and crash with ``TypeError: ... missing required positional
+    arguments``.
+
+    Observed in the wild on Windows topology masters whose
+    ``RequestServer`` sub-process spawns ``EventMonitor`` via its own
+    ``ProcessManager`` (second-generation pickle).
+    """
+    import pickle
+
+    original = _PickleRoundTripProcess("opts_val", "ipc_val", name="orig")
+    assert original._args_for_getstate == ("opts_val", "ipc_val")
+
+    first = pickle.loads(pickle.dumps(original))
+    assert first.opts == "opts_val"
+    assert first.ipc_publisher == "ipc_val"
+    # The round-trip MUST re-seed the pickle-support attributes so a
+    # subsequent pickle emits the same args, not empty ones.
+    assert first._args_for_getstate == ("opts_val", "ipc_val"), (
+        "second-generation pickle would lose args; " f"got {first._args_for_getstate!r}"
+    )
+
+    # Second-generation round-trip: this is where the original bug blew
+    # up with ``TypeError: __init__() missing 2 required positional
+    # arguments``.
+    second = pickle.loads(pickle.dumps(first))
+    assert second.opts == "opts_val"
+    assert second.ipc_publisher == "ipc_val"

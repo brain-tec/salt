@@ -1,12 +1,13 @@
 import importlib
 import os
 import time
+from types import SimpleNamespace
 
 import pytest
 
 import salt.config
 import salt.exceptions
-import salt.fileserver.gitfs
+import salt.utils.configparser
 import salt.utils.gitfs
 from salt.exceptions import FileserverConfigError
 from tests.support.helpers import patched_environ
@@ -173,73 +174,99 @@ def _prepare_remote_repository_pygit2(tmp_path):
 
 
 @pytest.fixture
-def _prepare_provider(tmp_path, minion_opts, _prepare_remote_repository_pygit2):
-    cache = tmp_path / "pygit2-repo-cache"
-    minion_opts.update(
-        {
-            "cachedir": str(cache),
-            "gitfs_disable_saltenv_mapping": False,
-            "gitfs_base": "master",
-            "gitfs_insecure_auth": False,
-            "gitfs_mountpoint": "",
-            "gitfs_passphrase": "",
-            "gitfs_password": "",
-            "gitfs_privkey": "",
-            "gitfs_provider": "pygit2",
-            "gitfs_pubkey": "",
-            "gitfs_ref_types": ["branch", "tag", "sha"],
-            "gitfs_refspecs": [
+def _make_provider(tmp_path, minion_opts, _prepare_remote_repository_pygit2):
+    """
+    Return a factory which builds a Pygit2 provider for the local test
+    repository. ``proxy`` sets the global default and ``remote`` allows passing
+    a per-remote configuration dict instead of a bare URL.
+    """
+
+    def _factory(proxy="", remote=None):
+        cache = tmp_path / "pygit2-repo-cache"
+        minion_opts.update(
+            {
+                "cachedir": str(cache),
+                "gitfs_disable_saltenv_mapping": False,
+                "gitfs_base": "master",
+                "gitfs_insecure_auth": False,
+                "gitfs_mountpoint": "",
+                "gitfs_passphrase": "",
+                "gitfs_password": "",
+                "gitfs_privkey": "",
+                "gitfs_provider": "pygit2",
+                "gitfs_proxy": proxy,
+                "gitfs_pubkey": "",
+                "gitfs_ref_types": ["branch", "tag", "sha"],
+                "gitfs_refspecs": [
+                    "+refs/heads/*:refs/remotes/origin/*",
+                    "+refs/tags/*:refs/tags/*",
+                ],
+                "gitfs_root": "",
+                "gitfs_saltenv_blacklist": [],
+                "gitfs_saltenv_whitelist": [],
+                "gitfs_ssl_verify": True,
+                "gitfs_update_interval": 3,
+                "gitfs_user": "",
+                "verified_gitfs_provider": "pygit2",
+            }
+        )
+        per_remote_defaults = {
+            "base": "master",
+            "disable_saltenv_mapping": False,
+            "insecure_auth": False,
+            "ref_types": ["branch", "tag", "sha"],
+            "passphrase": "",
+            "mountpoint": "",
+            "password": "",
+            "privkey": "",
+            "proxy": proxy,
+            "pubkey": "",
+            "refspecs": [
                 "+refs/heads/*:refs/remotes/origin/*",
                 "+refs/tags/*:refs/tags/*",
             ],
-            "gitfs_root": "",
-            "gitfs_saltenv_blacklist": [],
-            "gitfs_saltenv_whitelist": [],
-            "gitfs_proxy": "",
-            "gitfs_ssl_verify": True,
-            "gitfs_update_interval": 3,
-            "gitfs_user": "",
-            "verified_gitfs_provider": "pygit2",
+            "root": "",
+            "saltenv_blacklist": [],
+            "saltenv_whitelist": [],
+            "ssl_verify": True,
+            "update_interval": 60,
+            "user": "",
         }
-    )
-    per_remote_defaults = {
-        "base": "master",
-        "disable_saltenv_mapping": False,
-        "fallback": "",
-        "depth": 0,
-        "insecure_auth": False,
-        "ref_types": ["branch", "tag", "sha"],
-        "passphrase": "",
-        "mountpoint": "",
-        "password": "",
-        "privkey": "",
-        "pubkey": "",
-        "refspecs": [
-            "+refs/heads/*:refs/remotes/origin/*",
-            "+refs/tags/*:refs/tags/*",
-        ],
-        "root": "",
-        "saltenv_blacklist": [],
-        "saltenv_whitelist": [],
-        "proxy": "",
-        "ssl_verify": True,
-        "update_interval": 60,
-        "user": "",
-    }
-    per_remote_only = ("all_saltenvs", "name", "saltenv")
-    override_params = tuple(per_remote_defaults)
-    cache_root = cache / "gitfs"
-    role = "gitfs"
-    provider = salt.utils.gitfs.Pygit2(
-        minion_opts,
-        _prepare_remote_repository_pygit2,
-        per_remote_defaults,
-        per_remote_only,
-        override_params,
-        str(cache_root),
-        role,
-    )
-    return provider
+        per_remote_only = ("all_saltenvs", "name", "saltenv")
+        override_params = tuple(per_remote_defaults)
+        cache_root = cache / "gitfs"
+        role = "gitfs"
+        return salt.utils.gitfs.Pygit2(
+            minion_opts,
+            _prepare_remote_repository_pygit2 if remote is None else remote,
+            per_remote_defaults,
+            per_remote_only,
+            override_params,
+            str(cache_root),
+            role,
+        )
+
+    return _factory
+
+
+@pytest.fixture
+def _prepare_provider(_make_provider):
+    return _make_provider()
+
+
+def _http_proxy(provider):
+    """
+    Read back the http.proxy setting salt enforced on the repo's git config.
+    """
+    conf = salt.utils.configparser.GitConfigParser()
+    assert conf.read(os.path.join(provider.gitdir, "config"))
+    try:
+        return conf.get("http", "proxy")
+    except (
+        salt.utils.configparser.NoSectionError,
+        salt.utils.configparser.NoOptionError,
+    ):
+        return None
 
 
 @pytest.mark.skipif(not HAS_PYGIT2, reason="This host lacks proper pygit2 support")
@@ -260,6 +287,26 @@ def test_checkout_pygit2(_prepare_provider):
     assert provider.get_cachedir() in provider.checkout()
     provider.branch = "does_not_exist"
     assert provider.checkout() is None
+
+
+@pytest.mark.skipif(not HAS_PYGIT2, reason="This host lacks proper pygit2 support")
+@pytest.mark.skip_on_windows(
+    reason="Skip Pygit2 on windows, due to pygit2 access error on windows"
+)
+def test_init_remote_pygit2_git_config(_prepare_provider):
+    """
+    The repo config already includes .git/config, so init_remote must not add
+    it again (pygit2 >= 1.21 raises TypeError, older versions load it twice and
+    list every fetch refspec twice).
+    """
+    provider = _prepare_provider
+    assert provider.init_remote() is False
+    origin = provider.repo.remotes["origin"]
+    assert origin.url == provider.url
+    assert origin.fetch_refspecs == [
+        "+refs/heads/*:refs/remotes/origin/*",
+        "+refs/tags/*:refs/tags/*",
+    ]
 
 
 @pytest.mark.skipif(not HAS_PYGIT2, reason="This host lacks proper pygit2 support")
@@ -288,6 +335,177 @@ def test_get_cachedir_basename_pygit2(_prepare_provider):
     assert "_" == _prepare_provider.get_cache_basename()
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        salt.utils.gitfs.GITFS_PER_REMOTE_OVERRIDES,
+        salt.utils.gitfs.PILLAR_PER_REMOTE_OVERRIDES,
+        salt.utils.gitfs.WINREPO_PER_REMOTE_OVERRIDES,
+    ),
+)
+def test_proxy_is_a_per_remote_override(overrides):
+    """
+    The proxy can be configured globally and per remote for every git role.
+    """
+    assert "proxy" in overrides
+
+
+@pytest.mark.skipif(not HAS_PYGIT2, reason="This host lacks proper pygit2 support")
+@pytest.mark.skip_on_windows(
+    reason="Skip Pygit2 on windows, due to pygit2 access error on windows"
+)
+def test_proxy_per_remote_overrides_global(_make_provider):
+    """
+    A proxy set on an individual remote wins over the global default.
+    """
+    provider = _make_provider(
+        proxy="http://global.example.com:8080/",
+        remote={"https://example.com/salt.git": [{"proxy": "http://remote:8080/"}]},
+    )
+    assert provider.proxy == "http://remote:8080/"
+
+
+@pytest.mark.skipif(not HAS_PYGIT2, reason="This host lacks proper pygit2 support")
+@pytest.mark.skip_on_windows(
+    reason="Skip Pygit2 on windows, due to pygit2 access error on windows"
+)
+def test_proxy_written_to_git_config(_make_provider):
+    """
+    The configured proxy is enforced as http.proxy in the repo's git config,
+    which is where both libgit2 and the git CLI pick it up.
+    """
+    provider = _make_provider(
+        proxy="http://proxy.example.com:8080/",
+        remote="https://example.com/salt.git",
+    )
+    provider.remotecallbacks = None
+    provider.credentials = None
+    provider.init_remote()
+    assert _http_proxy(provider) == "http://proxy.example.com:8080/"
+
+
+@pytest.mark.skipif(not HAS_PYGIT2, reason="This host lacks proper pygit2 support")
+@pytest.mark.skip_on_windows(
+    reason="Skip Pygit2 on windows, due to pygit2 access error on windows"
+)
+def test_no_proxy_written_to_git_config_by_default(_prepare_provider):
+    """
+    With no proxy configured, http.proxy is left alone so that git's own
+    configuration and environment keep applying.
+    """
+    provider = _prepare_provider
+    provider.remotecallbacks = None
+    provider.credentials = None
+    provider.init_remote()
+    assert _http_proxy(provider) is None
+
+
+@pytest.mark.skipif(not HAS_PYGIT2, reason="This host lacks proper pygit2 support")
+@pytest.mark.skip_on_windows(
+    reason="Skip Pygit2 on windows, due to pygit2 access error on windows"
+)
+def test_proxy_cleared_from_git_config_when_unset(_make_provider):
+    """
+    Dropping the proxy from the salt config clears the previously enforced
+    value rather than leaving the repo pointed at a proxy that is gone.
+    """
+    provider = _make_provider(
+        proxy="http://proxy.example.com:8080/",
+        remote="https://example.com/salt.git",
+    )
+    provider.remotecallbacks = None
+    provider.credentials = None
+    provider.init_remote()
+    assert _http_proxy(provider) == "http://proxy.example.com:8080/"
+
+    provider.proxy = ""
+    provider.enforce_git_config()
+    assert _http_proxy(provider) == ""
+
+
+@pytest.mark.skipif(not HAS_PYGIT2, reason="This host lacks proper pygit2 support")
+@pytest.mark.skip_on_windows(
+    reason="Skip Pygit2 on windows, due to pygit2 access error on windows"
+)
+def test_pygit2_fetch_enables_proxy_lookup(_prepare_provider):
+    """
+    libgit2 ignores http.proxy unless proxy usage is enabled on the fetch
+    itself, so Pygit2._fetch has to ask for automatic proxy detection.
+    """
+    provider = _prepare_provider
+    provider.remotecallbacks = None
+    provider.credentials = None
+    provider.init_remote()
+    fetch_mock = MagicMock(return_value=SimpleNamespace(received_objects=0))
+    with patch.object(pygit2.Remote, "fetch", fetch_mock):
+        provider._fetch()
+    assert fetch_mock.call_args.kwargs["proxy"] is True
+
+
+@pytest.mark.skipif(
+    not HAS_PYGIT2 or not HAS_PYGIT2_ENUMS,
+    reason="This host lacks proper pygit2 support",
+)
+@pytest.mark.skip_on_windows(
+    reason="Skip Pygit2 on windows, due to pygit2 access error on windows"
+)
+def test_pygit2_fetch_prunes_without_legacy_constant(_prepare_provider, monkeypatch):
+    """
+    pygit2 1.20.0 removed GIT_FETCH_PRUNE. Pruning must still be requested on
+    fetch, so stale refs don't need the git CLI fallback, which is skipped
+    entirely for authenticated remotes.
+    """
+    monkeypatch.delattr(pygit2, "GIT_FETCH_PRUNE", raising=False)
+    provider = _prepare_provider
+    provider.remotecallbacks = None
+    provider.credentials = None
+    provider.repo = MagicMock()
+    provider.repo.listall_references.return_value = []
+    fetch_mock = provider.repo.remotes[0].fetch
+    fetch_mock.return_value = SimpleNamespace(received_objects=0)
+    with patch.object(
+        salt.utils.gitfs.GitProvider, "clean_stale_refs"
+    ) as fallback_mock:
+        provider._fetch()
+    assert fetch_mock.call_args.kwargs["prune"] == pygit2.enums.FetchPrune.PRUNE
+    fallback_mock.assert_not_called()
+
+
+@pytest.mark.skipif(
+    not HAS_PYGIT2 or not HAS_PYGIT2_ENUMS,
+    reason="This host lacks proper pygit2 support",
+)
+def test_pygit2_provider_does_not_need_git_cli(minion_opts, monkeypatch):
+    """
+    pygit2 prunes stale refs by itself, so the git CLI is not required, even on
+    pygit2 1.20.0 and newer where GIT_FETCH_PRUNE no longer exists.
+    """
+    monkeypatch.delattr(pygit2, "GIT_FETCH_PRUNE", raising=False)
+    minion_opts["gitfs_provider"] = "pygit2"
+    with patch("salt.utils.path.which", MagicMock(return_value=None)):
+        gitfs = salt.utils.gitfs.GitFS(minion_opts, {}, init_remotes=False)
+    assert gitfs.provider == "pygit2"
+
+
+@pytest.mark.skipif(not HAS_PYGIT2, reason="This host lacks proper pygit2 support")
+@pytest.mark.skip_on_windows(
+    reason="Skip Pygit2 on windows, due to pygit2 access error on windows"
+)
+def test_pygit2_warns_when_proxy_cannot_be_used(_make_provider):
+    """
+    pygit2 only proxies https remotes, so warn instead of silently connecting
+    directly.
+    """
+    provider = _make_provider(
+        proxy="http://proxy.example.com:8080/",
+        remote="http://example.com/salt.git",
+    )
+    provider.remotecallbacks = None
+    provider.credentials = None
+    with pytest.warns(UserWarning, match="pygit2 ignores proxy settings"):
+        provider.init_remote()
+
+
 @pytest.mark.skipif(not HAS_PYGIT2, reason="This host lacks proper pygit2 support")
 def test_find_file(tmp_path):
     opts = {
@@ -305,6 +523,12 @@ def test_find_file(tmp_path):
         "gitfs_root": "",
         "gitfs_env": "",
         "gitfs_fallback": "",
+        "gitfs_mountpoint": "",
+        "gitfs_saltenv_whitelist": [],
+        "gitfs_saltenv_blacklist": [],
+        "gitfs_disable_saltenv_mapping": False,
+        "gitfs_ref_types": ["branch", "tag", "sha"],
+        "gitfs_update_interval": 60,
     }
     remotes = []
 
@@ -329,6 +553,12 @@ def test_find_file_bad_path(tmp_path):
         "gitfs_root": "",
         "gitfs_env": "",
         "gitfs_fallback": "",
+        "gitfs_mountpoint": "",
+        "gitfs_saltenv_whitelist": [],
+        "gitfs_saltenv_blacklist": [],
+        "gitfs_disable_saltenv_mapping": False,
+        "gitfs_ref_types": ["branch", "tag", "sha"],
+        "gitfs_update_interval": 60,
     }
     remotes = []
 
@@ -354,6 +584,12 @@ def test_find_file_bad_env(tmp_path):
         "gitfs_root": "",
         "gitfs_env": "",
         "gitfs_fallback": "",
+        "gitfs_mountpoint": "",
+        "gitfs_saltenv_whitelist": [],
+        "gitfs_saltenv_blacklist": [],
+        "gitfs_disable_saltenv_mapping": False,
+        "gitfs_ref_types": ["branch", "tag", "sha"],
+        "gitfs_update_interval": 60,
     }
     remotes = []
 
@@ -429,9 +665,180 @@ def test_find_file_subdir(tmp_path):
         "gitfs_root": "",
         "gitfs_env": "",
         "gitfs_fallback": "",
+        "gitfs_mountpoint": "",
+        "gitfs_saltenv_whitelist": [],
+        "gitfs_saltenv_blacklist": [],
+        "gitfs_disable_saltenv_mapping": False,
+        "gitfs_ref_types": ["branch", "tag", "sha"],
+        "gitfs_update_interval": 60,
     }
     remotes = []
     gitfs = salt.utils.gitfs.GitFS(opts, remotes)
     gitfs.cache_root = str(root)
     ret = gitfs.find_file("foo/init.sls")
     assert ret == {"path": "", "rel": ""}
+
+
+@pytest.fixture
+def _pygit2_file_list_repo(tmp_path):
+    """
+    Build a repository whose tree holds nested directories, regular files, an
+    executable, an empty file, symlinks to a file and to a directory, an empty
+    directory and a submodule (gitlink) entry whose commit is not in the repo.
+    Returns the repository, the root tree and the ids of the trees and
+    symlink blobs, which are the only objects file_list needs to load.
+    """
+    repo = pygit2.init_repository(str(tmp_path / "file-list-repo"))
+
+    def _tree(*entries):
+        builder = repo.TreeBuilder()
+        for name, oid, mode in entries:
+            builder.insert(name, oid, mode)
+        return builder.write()
+
+    blob_mode = pygit2.GIT_FILEMODE_BLOB
+    link_mode = pygit2.GIT_FILEMODE_LINK
+    tree_mode = pygit2.GIT_FILEMODE_TREE
+    deep = _tree(("d.txt", repo.create_blob(b"d"), blob_mode))
+    sub = _tree(
+        ("c.txt", repo.create_blob(b"c"), blob_mode),
+        ("deep", deep, tree_mode),
+    )
+    empty_dir = _tree()
+    link_file = repo.create_blob(b"a.txt")
+    link_dir = repo.create_blob(b"sub")
+    root = _tree(
+        ("a.txt", repo.create_blob(b"a"), blob_mode),
+        ("run.sh", repo.create_blob(b"#!/bin/sh"), pygit2.GIT_FILEMODE_BLOB_EXECUTABLE),
+        ("empty", repo.create_blob(b""), blob_mode),
+        ("link_file", link_file, link_mode),
+        ("link_dir", link_dir, link_mode),
+        ("sub", sub, tree_mode),
+        ("empty_dir", empty_dir, tree_mode),
+        ("submodule", pygit2.Oid(hex="1" * 40), pygit2.GIT_FILEMODE_COMMIT),
+    )
+    return {
+        "repo": repo,
+        "tree": repo[root],
+        "loadable": {deep, sub, empty_dir, link_file, link_dir},
+    }
+
+
+class _CountingRepo:
+    """
+    Wrap a pygit2 repository, recording the object ids looked up through it
+    """
+
+    def __init__(self, repo):
+        self._repo = repo
+        self.looked_up = []
+        self.contains_calls = 0
+
+    def __getitem__(self, oid):
+        self.looked_up.append(oid)
+        return self._repo[oid]
+
+    def __contains__(self, oid):
+        self.contains_calls += 1
+        return oid in self._repo
+
+    def __getattr__(self, name):
+        return getattr(self._repo, name)
+
+
+def _pygit2_file_list(provider, fixture, root="", mountpoint="", repo=None):
+    provider.repo = repo if repo is not None else fixture["repo"]
+    with patch.object(provider, "get_tree", return_value=fixture["tree"]):
+        with patch.object(provider, "root", return_value=root):
+            with patch.object(provider, "mountpoint", return_value=mountpoint):
+                return provider.file_list("base")
+
+
+@pytest.mark.skipif(not HAS_PYGIT2, reason="This host lacks proper pygit2 support")
+@pytest.mark.skip_on_windows(
+    reason="Skip Pygit2 on windows, due to pygit2 access error on windows"
+)
+@pytest.mark.parametrize(
+    "root,mountpoint,files,symlinks",
+    [
+        (
+            "",
+            "",
+            {
+                "a.txt",
+                "run.sh",
+                "empty",
+                "link_file",
+                "link_dir",
+                "sub/c.txt",
+                "sub/deep/d.txt",
+            },
+            {"link_file": b"a.txt", "link_dir": b"sub"},
+        ),
+        (
+            "",
+            "mp",
+            {
+                "mp/a.txt",
+                "mp/run.sh",
+                "mp/empty",
+                "mp/link_file",
+                "mp/link_dir",
+                "mp/sub/c.txt",
+                "mp/sub/deep/d.txt",
+            },
+            {"mp/link_file": b"a.txt", "mp/link_dir": b"sub"},
+        ),
+        ("sub", "", {"c.txt", "deep/d.txt"}, {}),
+        ("sub", "mp/x", {"mp/x/c.txt", "mp/x/deep/d.txt"}, {}),
+        ("sub/deep", "", {"d.txt"}, {}),
+        # A root that is missing, is a file, is a symlink or is a submodule
+        # yields nothing
+        ("missing", "", set(), {}),
+        ("a.txt", "", set(), {}),
+        ("link_dir", "", set(), {}),
+        ("submodule", "", set(), {}),
+    ],
+)
+def test_pygit2_file_list(
+    _prepare_provider, _pygit2_file_list_repo, root, mountpoint, files, symlinks
+):
+    """
+    Symlinks are listed as files and their (bytes) target is recorded, they are
+    never followed. Empty directories add nothing and submodules are skipped.
+    """
+    ret = _pygit2_file_list(
+        _prepare_provider, _pygit2_file_list_repo, root=root, mountpoint=mountpoint
+    )
+    assert ret == (files, symlinks)
+
+
+@pytest.mark.skipif(not HAS_PYGIT2, reason="This host lacks proper pygit2 support")
+@pytest.mark.skip_on_windows(
+    reason="Skip Pygit2 on windows, due to pygit2 access error on windows"
+)
+def test_pygit2_file_list_no_tree(_prepare_provider, _pygit2_file_list_repo):
+    _prepare_provider.repo = _pygit2_file_list_repo["repo"]
+    with patch.object(_prepare_provider, "get_tree", return_value=None):
+        assert _prepare_provider.file_list("base") == (set(), {})
+
+
+@pytest.mark.skipif(not HAS_PYGIT2, reason="This host lacks proper pygit2 support")
+@pytest.mark.skip_on_windows(
+    reason="Skip Pygit2 on windows, due to pygit2 access error on windows"
+)
+def test_pygit2_file_list_only_loads_trees_and_symlinks(
+    _prepare_provider, _pygit2_file_list_repo
+):
+    """
+    Regular blobs must not be loaded from the object database while building
+    the file list, that made refreshing the file list cache very slow for big
+    repositories (issue #55419).
+    """
+    counting = _CountingRepo(_pygit2_file_list_repo["repo"])
+    files, _ = _pygit2_file_list(
+        _prepare_provider, _pygit2_file_list_repo, repo=counting
+    )
+    assert len(files) == 7
+    assert counting.contains_calls == 0
+    assert set(counting.looked_up) <= _pygit2_file_list_repo["loadable"]

@@ -132,7 +132,15 @@ class BaseCaller:
             salt.minion.get_proc_dir(self.opts["cachedir"]), ret["jid"]
         )
         if fun not in self.minion.functions:
-            docs = self.minion.functions["sys.doc"](f"{fun}*")
+            # Error-path documentation lookup: route through the unfiltered
+            # inner loader so ``sys.doc`` still resolves under a strict
+            # ``whitelist_modules`` that omits ``sys``.  The user-facing
+            # membership check above stays on the wire-filtered loader.
+            _sys_loader = (
+                getattr(self.minion.functions, "_dunder_salt", None)
+                or self.minion.functions
+            )
+            docs = _sys_loader["sys.doc"](f"{fun}*")
             if docs:
                 docs[fun] = self.minion.functions.missing_fun_string(fun)
                 ret["out"] = "nested"
@@ -314,8 +322,11 @@ class BaseCaller:
         tgt_type = self.opts.get("resources_tgt_type", "glob")
 
         # Resolve resources via the inherited helper (set up on MinionBase
-        # so SMinion sees it). The helper consults the minion's pillar
-        # (``opts["resources"]``) and per-resource grains cache.
+        # so SMinion sees it). The helper streams per-type IDs from the
+        # opts-driven inventory API (``resource_types`` + each type's
+        # ``discover(opts)`` via ``salt.utils.resources.enabled_resource_types``
+        # and ``Minion._iter_resource_ids``) and renders per-resource
+        # grains on demand.
         load = {"fun": fun, "tgt": tgt, "tgt_type": tgt_type}
         try:
             resource_targets = self.minion._resolve_resource_targets(load)

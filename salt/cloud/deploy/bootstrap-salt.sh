@@ -6,6 +6,7 @@
 # shellcheck disable=SC2317
 # shellcheck disable=SC2086
 # shellcheck disable=SC2329
+# shellcheck disable=SC2337
 #
 #======================================================================================================================
 # vim: softtabstop=4 shiftwidth=4 expandtab fenc=utf-8 spell spelllang=en cc=120
@@ -26,7 +27,7 @@
 #======================================================================================================================
 set -o nounset                              # Treat unset variables as an error
 
-__ScriptVersion="2026.07.10"
+__ScriptVersion="2026.10.08"
 __ScriptName="bootstrap-salt.sh"
 
 __ScriptFullName="$0"
@@ -256,6 +257,8 @@ _INSTALL_SYNDIC=$BS_FALSE
 _INSTALL_SALT_API=$BS_FALSE
 _INSTALL_MINION=$BS_TRUE
 _INSTALL_CLOUD=$BS_FALSE
+_INSTALL_SSH=$BS_FALSE
+_INSTALL_PROXY=$BS_FALSE
 _VIRTUALENV_DIR=${BS_VIRTUALENV_DIR:-"null"}
 _START_DAEMONS=$BS_TRUE
 _DISABLE_SALT_CHECKS=$BS_FALSE
@@ -282,6 +285,11 @@ _SALT_MINION_ID="null"
 _SIMPLIFY_VERSION=$BS_TRUE
 _LIBCLOUD_MIN_VERSION="0.14.0"
 _EXTRA_PACKAGES=""
+_PIP_REQUIREMENTS_FILE="null"
+# Where salt-pip is looked for. Fixed, absolute paths: this runs as root, so it must not be found through PATH
+_SALT_PIP_PATHS="/usr/bin/salt-pip /opt/saltstack/salt/salt-pip"
+_START_GUARD_ACTIVE=$BS_FALSE
+_POLICY_RC_D="/usr/sbin/policy-rc.d"
 _HTTP_PROXY=""
 _SALT_GIT_CHECKOUT_DIR=${BS_SALT_GIT_CHECKOUT_DIR:-${_TMP_DIR}/git/salt}
 _NO_DEPS=$BS_FALSE
@@ -372,6 +380,20 @@ __usage() {
         You can also do this by touching ${_TMP_DIR}/disable_salt_checks on the target
         host. Default: \${BS_FALSE}
     -D  Show debug output
+    -e  Path to a pip requirements file listing PyPI packages (for example Salt
+        Extensions) to install into the Salt onedir with salt-pip. The packages
+        are installed after Salt is installed and before its services are
+        started, so they are available the first time Salt starts. Pin versions
+        in the file, for example "saltext-foo==1.2.3". Custom or private
+        package indexes can be set with "--index-url" or "--extra-index-url"
+        lines in the file, or with the PIP_INDEX_URL and PIP_EXTRA_INDEX_URL
+        environment variables. Prefer these over putting credentials on the
+        command line. Use absolute paths for local packages in the file, and
+        do not leave the file writable by others, it is installed as root. If
+        the minion "user" is not root, the file must be readable by that user.
+        Only supported for onedir installs on Linux.
+        Packages that need compiling or system libraries can be satisfied
+        with -p, for example: -p build-essential -p libmariadb-dev
     -f  Force shallow cloning for git installations.
         This may result in an "n/a" in the version number.
     -F  Allow copied files to overwrite existing (config, init.d, etc)
@@ -437,11 +459,13 @@ __usage() {
     -x  Changes the Python version used to install Salt (default: Python 3).
         Python 2.7 is no longer supported.
     -X  Do not start daemons after installation
+    -y  Also install salt-ssh
+    -Y  Also install salt-proxy
 
 EOT
 }   # ----------  end of function __usage  ----------
 
-while getopts ':hvnDc:g:Gx:k:s:MSWNXCPFUKIA:i:Lp:dH:bflV:J:j:rR:T:aqQ' opt
+while getopts ':hvnDc:e:g:Gx:k:s:MSWNXCPFUKIA:i:Lp:dH:bflV:J:j:rR:T:aqQyY' opt
 do
   case "${opt}" in
 
@@ -450,6 +474,7 @@ do
     n )  _COLORS=0; __detect_color_support              ;;
     D )  _ECHO_DEBUG=$BS_TRUE                           ;;
     c )  _TEMP_CONFIG_DIR="$OPTARG"                     ;;
+    e )  _PIP_REQUIREMENTS_FILE="$OPTARG"               ;;
     g )  _SALT_REPO_URL=$OPTARG                         ;;
 
     G )  echowarn "The '-G' option is DEPRECATED and will be removed in the future stable release!"
@@ -489,6 +514,8 @@ do
     q )  _QUIET_GIT_INSTALLATION=$BS_TRUE               ;;
     Q )  _QUICK_START=$BS_TRUE                          ;;
     x )  _PY_EXE="$OPTARG"                              ;;
+    y )  _INSTALL_SSH=$BS_TRUE                          ;;
+    Y )  _INSTALL_PROXY=$BS_TRUE                        ;;
 
     \?)  echo
          echoerror "Option does not exist : $OPTARG"
@@ -544,6 +571,11 @@ exec 2>"$LOGPIPE"
 APT_ERR=$(mktemp ${_TMP_DIR}/apt_error.XXXXXX)
 __exit_cleanup() {
     EXIT_CODE=$?
+
+    # Never leave the policy-rc.d that blocks service starts behind, whatever way the script ends
+    if [ "$_START_GUARD_ACTIVE" -eq $BS_TRUE ]; then
+        __service_start_guard_off
+    fi
 
     if [ "$ITYPE" = "git" ] && [ -d "${_SALT_GIT_CHECKOUT_DIR}" ]; then
         if [ $_KEEP_TEMP_FILES -eq $BS_FALSE ]; then
@@ -617,6 +649,33 @@ ONEDIR_REV="latest"
 _ONEDIR_REV="latest"
 YUM_REPO_FILE="/etc/yum.repos.d/salt.repo"
 
+#---  FUNCTION  -------------------------------------------------------------------------------------------------------
+#          NAME:  __validate_salt_version_arg
+#   DESCRIPTION:  True (status 0) if $1 is a valid Salt version argument:
+#                 latest, a bare 4-digit major version, or MAJOR.MINOR[.MICRO]
+#                 with at most one of an rcN prerelease suffix or a -N
+#                 package-release suffix (e.g. 3006, 3008.1, 3008.0rc1, 3008.1-1).
+#----------------------------------------------------------------------------------------------------------------------
+__validate_salt_version_arg() {
+    echo "$1" | grep -qE '^(latest|[0-9]{4}(\.[0-9]+(\.[0-9]+)*(rc[0-9]+|-[0-9]+)?)?)$'
+}
+
+#---  FUNCTION  -------------------------------------------------------------------------------------------------------
+#          NAME:  __salt_version_string
+#   DESCRIPTION:  Render a validated Salt version string verbatim for use in
+#                 an RPM package name, an APT pin, a .repo section name, an
+#                 onedir/macOS tarball URL, or a GitHub release tag. A -N
+#                 package-release suffix (e.g. 3008.1-1) is a real, published
+#                 repackage of the same version across every artifact type
+#                 (RPM, APT, onedir, macOS, GitHub releases), so it must be
+#                 preserved verbatim everywhere rather than stripped or
+#                 rejected; rcN prerelease suffixes never contain a hyphen so
+#                 they pass through unchanged too.
+#----------------------------------------------------------------------------------------------------------------------
+__salt_version_string() {
+    echo "$1"
+}
+
 # check if systemd is functional
 __check_services_systemd_functional
 
@@ -664,13 +723,7 @@ elif [ "$ITYPE" = "stable" ]; then
         _ONEDIR_REV="latest"
         ITYPE="onedir"
     else
-        if [ "$(echo "$1" | grep -E '^(latest|[0-9]{4})$')" != "" ]; then
-            STABLE_REV="$1"
-            ONEDIR_REV="$1"
-            _ONEDIR_REV="$1"
-            ITYPE="onedir"
-            shift
-        elif [ "$(echo "$1" | grep -E '^([3-9][0-5]{2}[6-9](\.[0-9]*)?)')" != "" ]; then
+        if __validate_salt_version_arg "$1"; then
             STABLE_REV="$1"
             ONEDIR_REV="$1"
             _ONEDIR_REV="$1"
@@ -687,11 +740,7 @@ elif [ "$ITYPE" = "onedir" ]; then
         ONEDIR_REV="latest"
         STABLE_REV="latest"
     else
-        if [ "$(echo "$1" | grep -E '^(latest|[0-9]{4})$')" != "" ]; then
-            ONEDIR_REV="$1"
-            STABLE_REV="$1"
-            shift
-        elif [ "$(echo "$1" | grep -E '^([3-9][0-9]{3}(\.[0-9]*)?)')" != "" ]; then
+        if __validate_salt_version_arg "$1"; then
             ONEDIR_REV="$1"
             STABLE_REV="$1"
             shift
@@ -957,6 +1006,18 @@ __fetch_url() {
 }
 
 #---  FUNCTION  -------------------------------------------------------------------------------------------------------
+#         NAME:  __rewrite_repo_url
+#  DESCRIPTION:  Points a downloaded repo definition (salt.sources / salt.repo) at _REPO_URL instead of the default
+#                packages.broadcom.com/artifactory, so that -R is honored.
+#----------------------------------------------------------------------------------------------------------------------
+__rewrite_repo_url() {
+
+    [ -f "$1" ] || return 0
+    _REPO_URL_ESCAPED=$(printf '%s' "$_REPO_URL" | sed 's/[&#\\]/\\&/g')
+    sed -i "s#packages\.broadcom\.com/artifactory#${_REPO_URL_ESCAPED}#g" "$1"
+}
+
+#---  FUNCTION  -------------------------------------------------------------------------------------------------------
 #         NAME:  __check_url_exists
 #  DESCRIPTION:  Checks if a URL exists
 #----------------------------------------------------------------------------------------------------------------------
@@ -1083,7 +1144,7 @@ __strip_duplicates() {
 #                 enough.
 #----------------------------------------------------------------------------------------------------------------------
 __sort_release_files() {
-    KNOWN_RELEASE_FILES=$(echo "(arch|alpine|centos|debian|ubuntu|fedora|redhat|suse|\
+    KNOWN_RELEASE_FILES=$(echo "(altlinux|arch|alpine|centos|debian|ubuntu|fedora|redhat|suse|\
         mandrake|mandriva|gentoo|slackware|turbolinux|unitedlinux|void|lsb|system|\
         oracle|os|almalinux|rocky)(-|_)(release|version)" | sed -E 's:[[:space:]]::g')
     primary_release_files=""
@@ -1099,7 +1160,7 @@ __sort_release_files() {
     done
 
     # Now let's sort by know files importance, max important goes last in the max_prio list
-    max_prio="redhat-release centos-release oracle-release fedora-release almalinux-release rocky-release"
+    max_prio="redhat-release centos-release oracle-release fedora-release almalinux-release rocky-release altlinux-release"
     for entry in $max_prio; do
         if [ "$(echo "${primary_release_files}" | grep "$entry")" != "" ]; then
             primary_release_files=$(echo "${primary_release_files}" | sed -e "s:\\(.*\\)\\($entry\\)\\(.*\\):\\2 \\1 \\3:g")
@@ -1215,6 +1276,7 @@ __gather_linux_system_info() {
                     n="<R>ed <H>at <L>inux"
                 fi
                 ;;
+            altlinux           ) n="ALT Linux"      ;;
             arch               ) n="Arch Linux"     ;;
             alpine             ) n="Alpine Linux"   ;;
             centos             ) n="CentOS"         ;;
@@ -1250,6 +1312,10 @@ __gather_linux_system_info() {
                         n="Alpine Linux"
                         v="${rv}"
                         ;;
+                    altlinux    )
+                        n="ALT Linux"
+                        v="${rv}"
+                        ;;
                     amzn        )
                         # Amazon AMI's after 2014.09 match here
                         n="Amazon Linux AMI"
@@ -1272,6 +1338,9 @@ __gather_linux_system_info() {
                     opensuse-* )
                         n="opensuse"
                         v="${rv}"
+                        ;;
+                    photon      )
+                        n="VMware Photon OS"
                         ;;
                     *           )
                         n=${nn}
@@ -1596,8 +1665,9 @@ __debian_codename_translation() {
 __check_end_of_life_versions() {
     case "${DISTRO_NAME_L}" in
         debian)
-            # Debian versions below 11 are not supported
-            if [ "$DISTRO_MAJOR_VERSION" -lt 11 ]; then
+            # Debian 11 (bullseye) reached end of LTS support on 2026-08-31.
+            # See: https://www.debian.org/releases/bullseye/
+            if [ "$DISTRO_MAJOR_VERSION" -lt 12 ]; then
                 echoerror "End of life distributions are not supported."
                 echoerror "Please consider upgrading to the next stable. See:"
                 echoerror "    https://wiki.debian.org/DebianReleases"
@@ -1732,6 +1802,15 @@ __check_end_of_life_versions() {
                 exit 1
             fi
             ;;
+        alt*linux)
+            # ALT Linux versions lower than 10 are no longer supported
+            if [ "$DISTRO_MAJOR_VERSION" -lt 10 ]; then
+                echoerror "End of life distributions are not supported."
+                echoerror "Please consider upgrading to the next stable. See:"
+                echoerror "    https://www.basealt.ru/updates/"
+                exit 1
+            fi
+            ;;
 
         *)
             ;;
@@ -1822,6 +1901,165 @@ fi
 
 if [ "$_INSTALL_CLOUD" -eq $BS_TRUE ] && [ "$_CONFIG_ONLY" -eq $BS_FALSE ]; then
     echoinfo "Installing salt-cloud and required python3-libcloud package"
+fi
+
+#---  FUNCTION  -------------------------------------------------------------------------------------------------------
+#          NAME:  __validate_pip_requirements
+#   DESCRIPTION:  Validate the -e option before anything is installed, so a bad invocation fails fast instead of
+#                 half way through an installation. On success _PIP_REQUIREMENTS_FILE holds an absolute path.
+#----------------------------------------------------------------------------------------------------------------------
+__validate_pip_requirements() {
+
+    [ "$_PIP_REQUIREMENTS_FILE" = "null" ] && return 0
+
+    if [ "$ITYPE" != "onedir" ]; then
+        echoerror "-e is only supported for onedir installs because it relies on salt-pip."
+        return 1
+    fi
+
+    if [ "$DISTRO_NAME_L" = "macosx" ]; then
+        echoerror "-e is not supported on macOS. The Salt package starts the minion itself while it is being"
+        echoerror "installed, so there is no opportunity to install packages before Salt starts."
+        return 1
+    fi
+
+    if [ "$_CONFIG_ONLY" -eq $BS_TRUE ]; then
+        echoerror "-e can not be used with -C, Salt is not installed in configuration only mode."
+        return 1
+    fi
+
+    if [ ! -f "$_PIP_REQUIREMENTS_FILE" ] || [ ! -r "$_PIP_REQUIREMENTS_FILE" ]; then
+        echoerror "The requirements file passed to -e does not exist or is not readable: $_PIP_REQUIREMENTS_FILE"
+        return 1
+    fi
+
+    # pip refuses to run with nothing to install, so catch an empty or comment only file here
+    if ! grep -Eqv '^[[:space:]]*(#|$)' "$_PIP_REQUIREMENTS_FILE"; then
+        echoerror "The requirements file passed to -e does not list any packages: $_PIP_REQUIREMENTS_FILE"
+        return 1
+    fi
+
+    # Whoever can change this file controls what is installed as root (any package, any index, any local path)
+    # (-L so a symlink is judged by its target, a symlink itself is always rwxrwxrwx)
+    if [ -n "$(find -L "$_PIP_REQUIREMENTS_FILE" -maxdepth 0 -perm -002 2>/dev/null)" ]; then
+        echoerror "The requirements file passed to -e is writable by everyone: $_PIP_REQUIREMENTS_FILE"
+        echoerror "Anyone could change what is installed as root. Fix it with: chmod o-w <file>"
+        return 1
+    fi
+    if [ -n "$(find -L "$_PIP_REQUIREMENTS_FILE" -maxdepth 0 -perm -020 2>/dev/null)" ]; then
+        echowarn "The requirements file passed to -e is writable by its group: $_PIP_REQUIREMENTS_FILE"
+    fi
+
+    # Use an absolute path, salt-pip is run from a different working directory
+    _req_dir=$(cd "$(dirname "$_PIP_REQUIREMENTS_FILE")" && pwd) || return 1
+    _PIP_REQUIREMENTS_FILE="${_req_dir}/$(basename "$_PIP_REQUIREMENTS_FILE")"
+
+    return 0
+}   # ----------  end of function __validate_pip_requirements  ----------
+
+#---  FUNCTION  -------------------------------------------------------------------------------------------------------
+#          NAME:  __install_pip_requirements
+#   DESCRIPTION:  Install the packages listed in the -e requirements file into the Salt onedir using salt-pip. Must run
+#                 after Salt is installed and before its services are started.
+#----------------------------------------------------------------------------------------------------------------------
+__install_pip_requirements() {
+
+    [ "$_PIP_REQUIREMENTS_FILE" = "null" ] && return 0
+
+    # Only use salt-pip from its known locations, never one found through PATH, since this runs as root
+    _salt_pip=""
+    for _candidate in $_SALT_PIP_PATHS; do
+        if [ -x "$_candidate" ]; then
+            _salt_pip="$_candidate"
+            break
+        fi
+    done
+
+    if [ -z "$_salt_pip" ]; then
+        echoerror "salt-pip was not found, can not install the packages from $_PIP_REQUIREMENTS_FILE"
+        return 1
+    fi
+
+    echoinfo "Installing the Python packages listed in $_PIP_REQUIREMENTS_FILE using $_salt_pip"
+
+    # Run from / and not from the directory of the requirements file. "python -m pip" puts the working directory at the
+    # front of sys.path, so running from a directory that others can write to would let them run code as root by
+    # planting a module there. Nested -r files still resolve against the requirements file, local package paths in it
+    # need to be absolute. The file's contents are deliberately never echoed, it may hold index credentials.
+    if ! (cd / && "$_salt_pip" install -r "$_PIP_REQUIREMENTS_FILE"); then
+        echoerror "Failed to install the packages listed in $_PIP_REQUIREMENTS_FILE"
+        echoerror "If a package has to be compiled or needs system libraries, install those with -p, for example:"
+        echoerror "  -p build-essential -p libmariadb-dev"
+        echoerror "If the minion user is not root, the requirements file must be readable by that user."
+        return 1
+    fi
+
+    return 0
+}   # ----------  end of function __install_pip_requirements  ----------
+
+#---  FUNCTION  -------------------------------------------------------------------------------------------------------
+#          NAME:  __start_guard_needed
+#   DESCRIPTION:  Return 0 if package installs must be prevented from starting services. Only Debian and Ubuntu need
+#                 this: their packages start the service as soon as it is installed, so Salt would already be running,
+#                 without the -e packages, before they could be installed. The RPM packages and the other onedir
+#                 installs only enable the services and leave starting them to this script.
+#----------------------------------------------------------------------------------------------------------------------
+__start_guard_needed() {
+
+    [ "$_PIP_REQUIREMENTS_FILE" != "null" ] || return 1
+
+    case "$DISTRO_NAME_L" in
+        debian|ubuntu) return 0 ;;
+    esac
+
+    return 1
+}   # ----------  end of function __start_guard_needed  ----------
+
+#---  FUNCTION  -------------------------------------------------------------------------------------------------------
+#          NAME:  __service_start_guard_on
+#   DESCRIPTION:  Install a policy-rc.d that denies starting services, which dpkg maintainer scripts honour. Any
+#                 existing policy-rc.d is moved aside and put back by __service_start_guard_off. The exit trap also
+#                 calls it, so the policy is removed however this script ends.
+#----------------------------------------------------------------------------------------------------------------------
+__service_start_guard_on() {
+
+    _POLICY_RC_D_BACKUP="${_POLICY_RC_D}.salt-bootstrap-backup"
+
+    if [ -e "$_POLICY_RC_D" ] || [ -L "$_POLICY_RC_D" ]; then
+        mv -f "$_POLICY_RC_D" "$_POLICY_RC_D_BACKUP" || return 1
+    fi
+
+    if ! printf '#!/bin/sh\nexit 101\n' > "$_POLICY_RC_D" || ! chmod 755 "$_POLICY_RC_D"; then
+        __service_start_guard_off
+        return 1
+    fi
+
+    _START_GUARD_ACTIVE=$BS_TRUE
+    echodebug "Installed $_POLICY_RC_D to prevent services from starting during installation"
+
+    return 0
+}   # ----------  end of function __service_start_guard_on  ----------
+
+#---  FUNCTION  -------------------------------------------------------------------------------------------------------
+#          NAME:  __service_start_guard_off
+#   DESCRIPTION:  Remove the policy-rc.d installed by __service_start_guard_on and restore the original, if any.
+#----------------------------------------------------------------------------------------------------------------------
+__service_start_guard_off() {
+
+    rm -f "$_POLICY_RC_D"
+
+    if [ -e "$_POLICY_RC_D_BACKUP" ] || [ -L "$_POLICY_RC_D_BACKUP" ]; then
+        mv -f "$_POLICY_RC_D_BACKUP" "$_POLICY_RC_D"
+    fi
+
+    _START_GUARD_ACTIVE=$BS_FALSE
+    echodebug "Removed the policy-rc.d that prevented services from starting"
+
+    return 0
+}   # ----------  end of function __service_start_guard_off  ----------
+
+if ! __validate_pip_requirements; then
+    exit 1
 fi
 
 if [ $_START_DAEMONS -eq $BS_FALSE ]; then
@@ -2007,7 +2245,18 @@ __apt_key_fetch() {
     url=$1
 
     tempfile="$(__temp_gpg_pub)"
-    __fetch_url "$tempfile" "$url" || return 1
+    if ! __fetch_url "$tempfile" "$url"; then
+        # curl/wget have no access to credentials stored in apt's own
+        # /etc/apt/auth.conf(.d), so they fail against authenticated custom
+        # repos (see issue #2126). Fall back to apt-helper in that case,
+        # since it reuses apt's own acquire machinery and transparently
+        # honors those credentials, as well as any proxy/apt.conf settings.
+        # It isn't tried first because some WAFs/CDNs (e.g. in front of the
+        # default packages.broadcom.com repo) reject its request headers
+        # with a 406 that curl/wget don't trigger.
+        __check_command_exists /usr/lib/apt/apt-helper || return 1
+        /usr/lib/apt/apt-helper download-file "$url" "$tempfile" || return 1
+    fi
     mkdir -p /etc/apt/keyrings
     if __check_command_exists gpg; then
         # Newer apt requires the keyring in binary (dearmored) format.
@@ -2129,18 +2378,14 @@ __git_clone_and_checkout() {
             git fetch --tags upstream
         fi
 
-        echodebug "Hard reseting the cloned repository to ${GIT_REV_ADJ}"
-        git reset --hard "$GIT_REV_ADJ" || return 1
-
-        # Just calling `git reset --hard $GIT_REV_ADJ` on a branch name that has
-        # already been checked out will not update that branch to the upstream
-        # HEAD; instead it will simply reset to itself.  Check the ref to see
-        # if it is a branch name, check out the branch, and pull in the
-        # changes.
-        if git branch -a | grep -q "${GIT_REV_ADJ}"; then
-            echodebug "Rebasing the cloned repository branch"
-            git pull --rebase || return 1
+        # Check if GIT_REV_ADJ is a remote branch or just a commit hash
+        __GIT_CHECKOUT_REV="$GIT_REV_ADJ"
+        if git branch -r | grep -q -F -w "origin/$GIT_REV_ADJ"; then
+            __GIT_CHECKOUT_REV="origin/$GIT_REV_ADJ"
         fi
+
+        echodebug "Hard reseting the cloned repository to ${__GIT_CHECKOUT_REV}"
+        git reset --hard "$__GIT_CHECKOUT_REV" || return 1
     else
         if [ "$_FORCE_SHALLOW_CLONE" -eq "${BS_TRUE}" ]; then
             echoinfo "Forced shallow cloning of git repository."
@@ -2715,23 +2960,23 @@ __install_salt_from_repo() {
     echodebug "__install_salt_from_repo py_exe=$_py_exe"
 
     _py_version=$(${_py_exe} -c "import sys; print('{0}.{1}'.format(*sys.version_info))")
-    _pip_cmd="pip${_py_version}"
-    if ! __check_command_exists "${_pip_cmd}"; then
-        echodebug "The pip binary '${_pip_cmd}' was not found in PATH"
-        _pip_cmd="pip$(echo "${_py_version}" | cut -c -1)"
+    _pip_cmd="${_py_exe} -m pip"
+    if ${_pip_cmd} --version > /dev/null 2>&1; then
+        _pip_version="$(${_pip_cmd} --version 2>/dev/null)"
+    else
+        echodebug "Pip is not installed for Python '${_py_exe}' (version ${_py_version})"
+        _pip_cmd="pip${_py_version}"
         if ! __check_command_exists "${_pip_cmd}"; then
             echodebug "The pip binary '${_pip_cmd}' was not found in PATH"
-            _pip_cmd="pip"
-            if ! __check_command_exists "${_pip_cmd}"; then
-                echoerror "Unable to find a pip binary"
-                return 1
-            fi
+            echoerror "Unable to find a pip binary"
+            return 1
         fi
+        _pip_version="$(${_pip_cmd} --version 2>/dev/null)"
     fi
 
     __check_pip_allowed
 
-    echodebug "Installed pip version: $(${_pip_cmd} --version)"
+    echodebug "Installed pip version: $_pip_version"
 
     _setuptools_dep="setuptools>=${_MINIMUM_SETUPTOOLS_VERSION},<${_MAXIMUM_SETUPTOOLS_VERSION}"
     if [ "$_PY_MAJOR_VERSION" -ne 3 ]; then
@@ -2777,6 +3022,14 @@ __install_salt_from_repo() {
     else
         echoerror "Salt static CI requirements not found: expected requirements/static/ci/py${_py_version}/linux.lock or requirements/static/ci/py${_py_version}/linux.txt"
         return 1
+    fi
+
+    # mercurial==6.0.1 fails to build on Python 3.12 (uses removed PyLongObject.ob_digit)
+    # pygit2==1.13.1 requires libgit2 1.7.x, ALT ships 1.9.6 - use ALT's native
+    # python3-module-pygit2 package instead
+    if [ "${DISTRO_NAME_L}" = "alt_linux" ]; then
+        echodebug "Removing incompatible 'mercurial'/'pygit2' pins from ${_salt_static_ci_linux_req}"
+        sed -i -E '/^(mercurial|pygit2)==/d' "${_salt_static_ci_linux_req}"
     fi
 
     echodebug "Installing Salt requirements from PyPi, ${_pip_cmd} install ${_USE_BREAK_SYSTEM_PACKAGES} --ignore-installed ${_PIP_INSTALL_ARGS} -r ${_salt_static_ci_linux_req}"
@@ -3004,6 +3257,7 @@ __install_saltstack_ubuntu_repository() {
     # SaltStack's stable Ubuntu repository:
     __fetch_url "/etc/apt/sources.list.d/salt.sources" "https://github.com/saltstack/salt-install-guide/releases/latest/download/salt.sources"
     [ -f /etc/apt/sources.list.d/salt.sources ] && sed -i "s#salt-archive-keyring\.pgp#salt-archive-keyring.gpg#" /etc/apt/sources.list.d/salt.sources
+    __rewrite_repo_url /etc/apt/sources.list.d/salt.sources
     __apt_key_fetch "${HTTP_VAL}://${_REPO_URL}/api/security/keypair/SaltProjectKey/public" || return 1
     __wait_for_apt apt-get update || return 1
 
@@ -3057,6 +3311,7 @@ __install_saltstack_ubuntu_onedir_repository() {
     # SaltStack's stable Ubuntu repository:
     __fetch_url "/etc/apt/sources.list.d/salt.sources" "https://github.com/saltstack/salt-install-guide/releases/latest/download/salt.sources"
     [ -f /etc/apt/sources.list.d/salt.sources ] && sed -i "s#salt-archive-keyring\.pgp#salt-archive-keyring.gpg#" /etc/apt/sources.list.d/salt.sources
+    __rewrite_repo_url /etc/apt/sources.list.d/salt.sources
     __apt_key_fetch "${HTTP_VAL}://${_REPO_URL}/api/security/keypair/SaltProjectKey/public" || return 1
     __wait_for_apt apt-get update || return 1
 
@@ -3067,7 +3322,7 @@ __install_saltstack_ubuntu_onedir_repository() {
             echo "Pin: version $ONEDIR_REV.*" >> /etc/apt/preferences.d/salt-pin-1001
             echo "Pin-Priority: 1001" >> /etc/apt/preferences.d/salt-pin-1001
         elif [ "$(echo "$ONEDIR_REV" | grep -E '^([3-9][0-5]{2}[6-9](\.[0-9]*)?)')" != "" ]; then
-            ONEDIR_REV_DOT=$(echo "$ONEDIR_REV" | sed 's/-/\./')
+            ONEDIR_REV_DOT=$(__salt_version_string "$ONEDIR_REV")
             echo "Package: salt-*" > /etc/apt/preferences.d/salt-pin-1001
             echo "Pin: version $ONEDIR_REV_DOT" >> /etc/apt/preferences.d/salt-pin-1001
             echo "Pin-Priority: 1001" >> /etc/apt/preferences.d/salt-pin-1001
@@ -3274,6 +3529,14 @@ install_ubuntu_stable() {
         __PACKAGES="${__PACKAGES} salt-api"
     fi
 
+    if [ "$_INSTALL_SSH" -eq $BS_TRUE ]; then
+        __PACKAGES="${__PACKAGES} salt-ssh"
+    fi
+
+    if [ "$_INSTALL_PROXY" -eq $BS_TRUE ]; then
+        __PACKAGES="${__PACKAGES} salt-proxy"
+    fi
+
     # shellcheck disable=SC2086
     __apt_get_install_noinput ${__PACKAGES} || return 1
 
@@ -3333,6 +3596,14 @@ install_ubuntu_onedir() {
         __PACKAGES="${__PACKAGES} salt-api"
     fi
 
+    if [ "$_INSTALL_SSH" -eq $BS_TRUE ]; then
+        __PACKAGES="${__PACKAGES} salt-ssh"
+    fi
+
+    if [ "$_INSTALL_PROXY" -eq $BS_TRUE ]; then
+        __PACKAGES="${__PACKAGES} salt-proxy"
+    fi
+
     # shellcheck disable=SC2086
     __apt_get_install_noinput ${__PACKAGES} || return 1
 
@@ -3363,6 +3634,11 @@ install_ubuntu_stable_post() {
         fi
     done
 
+    return 0
+}
+
+install_ubuntu_onedir_post() {
+    install_ubuntu_stable_post || return 1
     return 0
 }
 
@@ -3509,6 +3785,7 @@ __install_saltstack_debian_repository() {
 
     __fetch_url "/etc/apt/sources.list.d/salt.sources" "https://github.com/saltstack/salt-install-guide/releases/latest/download/salt.sources"
     [ -f /etc/apt/sources.list.d/salt.sources ] && sed -i "s#salt-archive-keyring\.pgp#salt-archive-keyring.gpg#" /etc/apt/sources.list.d/salt.sources
+    __rewrite_repo_url /etc/apt/sources.list.d/salt.sources
     __apt_key_fetch "${HTTP_VAL}://${_REPO_URL}/api/security/keypair/SaltProjectKey/public" || return 1
     __wait_for_apt apt-get update || return 1
 
@@ -3519,7 +3796,7 @@ __install_saltstack_debian_repository() {
             echo "Pin: version $STABLE_REV.*" >> /etc/apt/preferences.d/salt-pin-1001
             echo "Pin-Priority: 1001" >> /etc/apt/preferences.d/salt-pin-1001
         elif [ "$(echo "$STABLE_REV" | grep -E '^([3-9][0-5]{2}[6-9](\.[0-9]*)?)')" != "" ]; then
-            STABLE_REV_DOT=$(echo "$STABLE_REV" | sed 's/-/\./')
+            STABLE_REV_DOT=$(__salt_version_string "$STABLE_REV")
             MINOR_VER_STRG="-$STABLE_REV_DOT"
             echo "Package: salt-*" > /etc/apt/preferences.d/salt-pin-1001
             echo "Pin: version $STABLE_REV_DOT" >> /etc/apt/preferences.d/salt-pin-1001
@@ -3555,6 +3832,7 @@ __install_saltstack_debian_onedir_repository() {
 
     __fetch_url "/etc/apt/sources.list.d/salt.sources" "https://github.com/saltstack/salt-install-guide/releases/latest/download/salt.sources"
     [ -f /etc/apt/sources.list.d/salt.sources ] && sed -i "s#salt-archive-keyring\.pgp#salt-archive-keyring.gpg#" /etc/apt/sources.list.d/salt.sources
+    __rewrite_repo_url /etc/apt/sources.list.d/salt.sources
     __apt_key_fetch "${HTTP_VAL}://${_REPO_URL}/api/security/keypair/SaltProjectKey/public" || return 1
     __wait_for_apt apt-get update || return 1
 
@@ -3565,7 +3843,7 @@ __install_saltstack_debian_onedir_repository() {
             echo "Pin: version $ONEDIR_REV.*" >> /etc/apt/preferences.d/salt-pin-1001
             echo "Pin-Priority: 1001" >> /etc/apt/preferences.d/salt-pin-1001
         elif [ "$(echo "$ONEDIR_REV" | grep -E '^([3-9][0-5]{2}[6-9](\.[0-9]*)?)')" != "" ]; then
-            ONEDIR_REV_DOT=$(echo "$ONEDIR_REV" | sed 's/-/\./')
+            ONEDIR_REV_DOT=$(__salt_version_string "$ONEDIR_REV")
             echo "Package: salt-*" > /etc/apt/preferences.d/salt-pin-1001
             echo "Pin: version $ONEDIR_REV_DOT" >> /etc/apt/preferences.d/salt-pin-1001
             echo "Pin-Priority: 1001" >> /etc/apt/preferences.d/salt-pin-1001
@@ -3691,6 +3969,14 @@ install_debian_stable() {
         __PACKAGES="${__PACKAGES} salt-api"
     fi
 
+    if [ "$_INSTALL_SSH" -eq $BS_TRUE ]; then
+        __PACKAGES="${__PACKAGES} salt-ssh"
+    fi
+
+    if [ "$_INSTALL_PROXY" -eq $BS_TRUE ]; then
+        __PACKAGES="${__PACKAGES} salt-proxy"
+    fi
+
     # shellcheck disable=SC2086
     __apt_get_install_noinput ${__PACKAGES} || return 1
 
@@ -3770,6 +4056,14 @@ install_debian_onedir() {
 
     if [ "$_INSTALL_SALT_API" -eq $BS_TRUE ]; then
         __PACKAGES="${__PACKAGES} salt-api"
+    fi
+
+    if [ "$_INSTALL_SSH" -eq $BS_TRUE ]; then
+        __PACKAGES="${__PACKAGES} salt-ssh"
+    fi
+
+    if [ "$_INSTALL_PROXY" -eq $BS_TRUE ]; then
+        __PACKAGES="${__PACKAGES} salt-proxy"
     fi
 
     # shellcheck disable=SC2086
@@ -3894,6 +4188,7 @@ __install_saltstack_fedora_onedir_repository() {
     if [ ! -s "$YUM_REPO_FILE" ] || [ "$_FORCE_OVERWRITE" -eq $BS_TRUE ]; then
         FETCH_URL="https://github.com/saltstack/salt-install-guide/releases/latest/download/salt.repo"
         __fetch_url "${YUM_REPO_FILE}" "${FETCH_URL}"
+        __rewrite_repo_url "${YUM_REPO_FILE}"
         if [ "$ONEDIR_REV" != "latest" ]; then
             # 3006.x is default, and latest for 3006.x branch
             if [ "$(echo "$ONEDIR_REV" | grep -E '^[0-9]{4}$')" != "" ]; then
@@ -3915,7 +4210,7 @@ __install_saltstack_fedora_onedir_repository() {
                 fi
             elif [ "$(echo "$ONEDIR_REV" | grep -E '^([3-9][0-5]{2}[6-9](\.[0-9]*)?)')" != "" ]; then
                 # using minor version
-                ONEDIR_REV_DOT=$(echo "$ONEDIR_REV" | sed 's/-/\./')
+                ONEDIR_REV_DOT=$(__salt_version_string "$ONEDIR_REV")
                 echo "[salt-repo-${ONEDIR_REV_DOT}-lts]" > "${YUM_REPO_FILE}"
                 # shellcheck disable=SC2129
                 echo "name=Salt Repo for Salt v${ONEDIR_REV_DOT} LTS" >> "${YUM_REPO_FILE}"
@@ -4152,7 +4447,7 @@ install_fedora_onedir() {
         MINOR_VER_STRG=""
     elif [ "$(echo "$STABLE_REV" | grep -E '^([3-9][0-5]{2}[6-9](\.[0-9]*)?)')" != "" ]; then
         # Minor version Salt, need to add specific minor version
-        STABLE_REV_DOT=$(echo "$STABLE_REV" | sed 's/-/\./')
+        STABLE_REV_DOT=$(__salt_version_string "$STABLE_REV")
         MINOR_VER_STRG="-$STABLE_REV_DOT"
     else
         MINOR_VER_STRG=""
@@ -4175,6 +4470,14 @@ install_fedora_onedir() {
 
     if [ "$_INSTALL_SALT_API" -eq $BS_TRUE ]; then
         __PACKAGES="${__PACKAGES} salt-api$MINOR_VER_STRG"
+    fi
+
+    if [ "$_INSTALL_SSH" -eq $BS_TRUE ]; then
+        __PACKAGES="${__PACKAGES} salt-ssh$MINOR_VER_STRG"
+    fi
+
+    if [ "$_INSTALL_PROXY" -eq $BS_TRUE ]; then
+        __PACKAGES="${__PACKAGES} salt-proxy$MINOR_VER_STRG"
     fi
 
     # shellcheck disable=SC2086
@@ -4224,6 +4527,7 @@ __install_saltstack_rhel_onedir_repository() {
     if [ ! -s "$YUM_REPO_FILE" ] || [ "$_FORCE_OVERWRITE" -eq $BS_TRUE ]; then
         FETCH_URL="https://github.com/saltstack/salt-install-guide/releases/latest/download/salt.repo"
         __fetch_url "${YUM_REPO_FILE}" "${FETCH_URL}"
+        __rewrite_repo_url "${YUM_REPO_FILE}"
         if [ "$ONEDIR_REV" != "latest" ]; then
             # 3006.x is default, and latest for 3006.x branch
             if [ "$(echo "$ONEDIR_REV" | grep -E '^[0-9]{4}$')" != "" ]; then
@@ -4245,7 +4549,7 @@ __install_saltstack_rhel_onedir_repository() {
                 fi
             elif [ "$(echo "$ONEDIR_REV" | grep -E '^([3-9][0-5]{2}[6-9](\.[0-9]*)?)')" != "" ]; then
                 # using minor version
-                ONEDIR_REV_DOT=$(echo "$ONEDIR_REV" | sed 's/-/\./')
+                ONEDIR_REV_DOT=$(__salt_version_string "$ONEDIR_REV")
                 echo "[salt-repo-${ONEDIR_REV_DOT}-lts]" > "${YUM_REPO_FILE}"
                 # shellcheck disable=SC2129
                 echo "name=Salt Repo for Salt v${ONEDIR_REV_DOT} LTS" >> "${YUM_REPO_FILE}"
@@ -4317,7 +4621,7 @@ install_centos_stable() {
         MINOR_VER_STRG=""
     elif [ "$(echo "$STABLE_REV" | grep -E '^([3-9][0-5]{2}[6-9](\.[0-9]*)?)')" != "" ]; then
         # Minor version Salt, need to add specific minor version
-        STABLE_REV_DOT=$(echo "$STABLE_REV" | sed 's/-/\./')
+        STABLE_REV_DOT=$(__salt_version_string "$STABLE_REV")
         MINOR_VER_STRG="-$STABLE_REV_DOT"
     else
         MINOR_VER_STRG=""
@@ -4340,6 +4644,14 @@ install_centos_stable() {
 
     if [ "$_INSTALL_SALT_API" -eq $BS_TRUE ]; then
         __PACKAGES="${__PACKAGES} salt-api$MINOR_VER_STRG"
+    fi
+
+    if [ "$_INSTALL_SSH" -eq $BS_TRUE ]; then
+        __PACKAGES="${__PACKAGES} salt-ssh$MINOR_VER_STRG"
+    fi
+
+    if [ "$_INSTALL_PROXY" -eq $BS_TRUE ]; then
+        __PACKAGES="${__PACKAGES} salt-proxy$MINOR_VER_STRG"
     fi
 
     # shellcheck disable=SC2086
@@ -4537,7 +4849,7 @@ install_centos_onedir() {
         MINOR_VER_STRG=""
     elif [ "$(echo "$ONEDIR_REV" | grep -E '^([3-9][0-5]{2}[6-9](\.[0-9]*)?)')" != "" ]; then
         # Minor version Salt, need to add specific minor version
-        ONEDIR_REV_DOT=$(echo "$ONEDIR_REV" | sed 's/-/\./')
+        ONEDIR_REV_DOT=$(__salt_version_string "$ONEDIR_REV")
         MINOR_VER_STRG="-$ONEDIR_REV_DOT"
     else
         MINOR_VER_STRG=""
@@ -4560,6 +4872,14 @@ install_centos_onedir() {
 
     if [ "$_INSTALL_SALT_API" -eq $BS_TRUE ]; then
         __PACKAGES="${__PACKAGES} salt-api$MINOR_VER_STRG"
+    fi
+
+    if [ "$_INSTALL_SSH" -eq $BS_TRUE ]; then
+        __PACKAGES="${__PACKAGES} salt-ssh$MINOR_VER_STRG"
+    fi
+
+    if [ "$_INSTALL_PROXY" -eq $BS_TRUE ]; then
+        __PACKAGES="${__PACKAGES} salt-proxy$MINOR_VER_STRG"
     fi
 
     # shellcheck disable=SC2086
@@ -5450,7 +5770,7 @@ install_alpine_linux_git_deps() {
     # shellcheck disable=SC2119
     __git_clone_and_checkout || return 1
 
-    apk -U add python3 python3-dev py3-pip py3-setuptools g++ linux-headers zeromq-dev openrc || return 1
+    apk -U add python3 python3-dev py3-pip py3-setuptools g++ linux-headers zeromq-dev openrc openssl-dev || return 1
     _PY_EXE=python3
     return 0
 }
@@ -5476,6 +5796,14 @@ install_alpine_linux_stable() {
         __PACKAGES="${__PACKAGES} salt-api"
     fi
 
+    if [ "$_INSTALL_SSH" -eq $BS_TRUE ]; then
+        __PACKAGES="${__PACKAGES} salt-ssh"
+    fi
+
+    if [ "$_INSTALL_PROXY" -eq $BS_TRUE ]; then
+        __PACKAGES="${__PACKAGES} salt-proxy"
+    fi
+
     # shellcheck disable=SC2086
     apk -U add "${__PACKAGES}" || return 1
     return 0
@@ -5498,15 +5826,22 @@ install_alpine_linux_post() {
         [ $fname = "syndic" ] && [ "$_INSTALL_SYNDIC" -eq $BS_FALSE ] && continue
 
         if [ -f /sbin/rc-update ]; then
-            script_url="${_SALTSTACK_REPO_URL%.git}/raw/master/pkg/alpine/salt-$fname"
-            [ -f "/etc/init.d/salt-$fname" ] || __fetch_url "/etc/init.d/salt-$fname" "$script_url"
+            script_path="/etc/init.d/salt-$fname"
+            if ! [ -f "$script_path" ]; then
+                cat <<_eof > "$script_path"
+#!/sbin/openrc-run
+command="/usr/bin/salt-${fname}"
+command_args="--daemon"
+pidfile="/var/run/salt-${fname}.pid"
+name="Salt ${fname} daemon"
 
-            # shellcheck disable=SC2181
-            if [ $? -eq 0 ]; then
-                chmod +x "/etc/init.d/salt-$fname"
-            else
-                echoerror "Failed to get OpenRC init script for $OS_NAME from $script_url."
-                return 1
+depend() {
+        need localmount
+        use net
+        after bootmisc
+}
+_eof
+                chmod +x "$script_path"
             fi
 
             # Skip salt-api since the service should be opt-in and not necessarily started on boot
@@ -5697,7 +6032,7 @@ install_amazon_linux_ami_2_deps() {
                     fi
                 elif [ "$(echo "$STABLE_REV" | grep -E '^([3-9][0-5]{2}[6-9](\.[0-9]*)?)')" != "" ]; then
                     # using minor version
-                    STABLE_REV_DOT=$(echo "$STABLE_REV" | sed 's/-/\./')
+                    STABLE_REV_DOT=$(__salt_version_string "$STABLE_REV")
                     echo "[salt-repo-${STABLE_REV_DOT}-lts]" > "${YUM_REPO_FILE}"
                     echo "name=Salt Repo for Salt v${STABLE_REV_DOT} LTS" >> "${YUM_REPO_FILE}"
                     echo "baseurl=https://${_REPO_URL}/saltproject-rpm/" >> "${YUM_REPO_FILE}"
@@ -5798,7 +6133,7 @@ install_amazon_linux_ami_2_onedir_deps() {
                     fi
                 elif [ "$(echo "$ONEDIR_REV" | grep -E '^([3-9][0-5]{2}[6-9](\.[0-9]*)?)')" != "" ]; then
                     # using minor version
-                    ONEDIR_REV_DOT=$(echo "$ONEDIR_REV" | sed 's/-/\./')
+                    ONEDIR_REV_DOT=$(__salt_version_string "$ONEDIR_REV")
                     echo "[salt-repo-${ONEDIR_REV_DOT}-lts]" > "${YUM_REPO_FILE}"
                     echo "name=Salt Repo for Salt v${ONEDIR_REV_DOT} LTS" >> "${YUM_REPO_FILE}"
                     echo "baseurl=https://${_REPO_URL}/saltproject-rpm/" >> "${YUM_REPO_FILE}"
@@ -5991,7 +6326,7 @@ install_amazon_linux_ami_2023_onedir_deps() {
                     fi
                 elif [ "$(echo "$ONEDIR_REV" | grep -E '^([3-9][0-5]{2}[6-9](\.[0-9]*)?)')" != "" ]; then
                     # using minor version
-                    ONEDIR_REV_DOT=$(echo "$ONEDIR_REV" | sed 's/-/\./')
+                    ONEDIR_REV_DOT=$(__salt_version_string "$ONEDIR_REV")
                     echo "[salt-repo-${ONEDIR_REV_DOT}-lts]" > "${YUM_REPO_FILE}"
                     echo "name=Salt Repo for Salt v${ONEDIR_REV_DOT} LTS" >> "${YUM_REPO_FILE}"
                     echo "baseurl=https://${_REPO_URL}/saltproject-rpm/" >> "${YUM_REPO_FILE}"
@@ -6212,17 +6547,30 @@ install_arch_linux_onedir() {
 
     version="${ONEDIR_REV:-latest}"
     arch="x86_64"
-    [ "$(uname -m)" = "aarch64" ] && arch="aarch64"
+    # Onedir tarball filenames use "arm64", not the "aarch64" uname reports.
+    [ "$(uname -m)" = "aarch64" ] && arch="arm64"
 
-    # Resolve "latest" to actual version
+    # Resolve "latest", or a bare major version (e.g. "3006"), to the actual
+    # latest GA release for that series via the artifactory directory listing
+    # (same mechanism used for macOS/Windows/Photon onedir installs). A full
+    # version string (e.g. "3006.26") is used as-is.
     if [ "$version" = "latest" ]; then
-        version=$(wget -qO- https://api.github.com/repos/saltstack/salt/releases/latest \
-                  | grep -Eo '"tag_name": *"v[0-9.]+"' \
-                  | sed 's/"tag_name": *"v//;s/"//') || return 1
+        __get_packagesite_onedir_latest || return 1
+        version="$_GENERIC_PKG_VERSION"
+    elif [ "$(echo "$version" | grep -E '^[0-9]{4}$')" != "" ]; then
+        __get_packagesite_onedir_latest "$version" || return 1
+        version="$_GENERIC_PKG_VERSION"
+    else
+        version=$(__salt_version_string "$version")
     fi
 
     tarball="salt-${version}-onedir-linux-${arch}.tar.xz"
-    url="https://github.com/saltstack/salt/releases/download/v${version}/${tarball}"
+    # GitHub Releases doesn't carry an onedir tarball asset for every
+    # historical point release (only newer ones do), while the artifactory
+    # generic repo has the complete history - it's the same source already
+    # used by the macOS/Windows/Photon onedir installers, and by the CI
+    # images' own provisioning.
+    url="https://${_REPO_URL}/saltproject-generic/onedir/${version}/${tarball}"
     extractdir="/tmp/salt-${version}-onedir-linux-${arch}"
 
     echoinfo "Downloading Salt onedir: $url"
@@ -6390,20 +6738,41 @@ install_arch_check_services() {
 install_arch_linux_onedir_post() {
     echodebug "install_arch_linux_onedir_post() entry"
 
-    # Disable any distro/AUR salt units
-    systemctl disable --now salt-minion.service 2>/dev/null || true
-    systemctl disable --now salt-master.service 2>/dev/null || true
+    # Add onedir paths system-wide. This only takes effect for login/interactive
+    # shells that source /etc/profile.d - it does not help something like
+    # `docker exec <container> salt-call ...`, which runs without one, so also
+    # symlink the onedir binaries into /usr/bin, already on PATH everywhere.
+    cat >/etc/profile.d/saltstack.sh <<'EOF'
+export PATH=/opt/saltstack/salt:/opt/saltstack/salt/bin:$PATH
+EOF
 
-    # Drop a clean unit, same pattern as Debian/Ubuntu onedir
-    cat >/etc/systemd/system/salt-minion.service <<'EOF'
+    chmod 644 /etc/profile.d/saltstack.sh
+
+    for bin in /opt/saltstack/salt/salt*; do
+        [ -f "$bin" ] && [ -x "$bin" ] && ln -sf "$bin" "/usr/bin/$(basename "$bin")"
+    done
+
+    for fname in api master minion syndic; do
+        # Skip salt-api since the service should be opt-in and not necessarily started on boot
+        [ $fname = "api" ] && continue
+
+        # Skip if not meant to be installed
+        [ $fname = "master" ] && [ "$_INSTALL_MASTER" -eq $BS_FALSE ] && continue
+        [ $fname = "minion" ] && [ "$_INSTALL_MINION" -eq $BS_FALSE ] && continue
+        [ $fname = "syndic" ] && [ "$_INSTALL_SYNDIC" -eq $BS_FALSE ] && continue
+
+        # Disable any distro/AUR salt unit before dropping our own
+        systemctl disable --now "salt-${fname}.service" 2>/dev/null || true
+
+        cat >"/etc/systemd/system/salt-${fname}.service" <<EOF
 [Unit]
-Description=Salt Minion (onedir)
+Description=Salt ${fname} (onedir)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/opt/saltstack/salt/salt-minion -c /etc/salt
+ExecStart=/opt/saltstack/salt/salt-${fname} -c /etc/salt
 Restart=always
 LimitNOFILE=100000
 
@@ -6411,18 +6780,12 @@ LimitNOFILE=100000
 WantedBy=multi-user.target
 EOF
 
+        if [ "$_START_DAEMONS" -eq $BS_TRUE ]; then
+            systemctl enable --now "salt-${fname}.service"
+        fi
+    done
+
     systemctl daemon-reload
-
-    # Add onedir paths system-wide
-    cat >/etc/profile.d/saltstack.sh <<'EOF'
-export PATH=/opt/saltstack/salt:/opt/saltstack/salt/bin:$PATH
-EOF
-
-    chmod 644 /etc/profile.d/saltstack.sh
-
-    if [ "$_START_DAEMONS" -eq $BS_TRUE ]; then
-        systemctl enable --now salt-minion.service
-    fi
 
     return 0
 }
@@ -6439,11 +6802,15 @@ EOF
 
 #---  FUNCTION  -------------------------------------------------------------------------------------------------------
 #          NAME:  __salt_onedir_filter_ga_version_dirs
-#   DESCRIPTION:  From stdin: keep only GA CalVer-style directory names (digits and dots;
-#                 prerelease dirs like 3008.0rc1 are excluded).
+#   DESCRIPTION:  From stdin: keep only GA CalVer-style directory names (digits
+#                 and dots, with an optional -N package-release suffix, e.g.
+#                 3008.1 or 3008.1-1). Prerelease dirs like 3008.0rc1 are
+#                 excluded; sort -V already orders 3008.1-1 after 3008.1, so
+#                 "latest"/major-only resolution naturally prefers a -N
+#                 repackage over the bare version it replaces.
 #----------------------------------------------------------------------------------------------------------------------
 __salt_onedir_filter_ga_version_dirs() {
-    grep -E '^[0-9]+\.[0-9]+(\.[0-9]+)*$'
+    grep -E '^[0-9]+\.[0-9]+(\.[0-9]+)*(-[0-9]+)?$'
 }
 
 #---  FUNCTION  -------------------------------------------------------------------------------------------------------
@@ -6544,7 +6911,7 @@ __install_saltstack_vmware_photon_os_onedir_repository() {
                 fi
             elif [ "$(echo "$ONEDIR_REV" | grep -E '^([3-9][0-5]{2}[6-9](\.[0-9]*)?)')" != "" ]; then
                 # using minor version
-                ONEDIR_REV_DOT=$(echo "$ONEDIR_REV" | sed 's/-/\./')
+                ONEDIR_REV_DOT=$(__salt_version_string "$ONEDIR_REV")
                 echo "[salt-repo-${ONEDIR_REV_DOT}-lts]" > "${YUM_REPO_FILE}"
                 echo "name=Salt Repo for Salt v${ONEDIR_REV_DOT} LTS" >> "${YUM_REPO_FILE}"
                 echo "baseurl=https://${_REPO_URL}/saltproject-rpm/" >> "${YUM_REPO_FILE}"
@@ -6837,7 +7204,7 @@ install_vmware_photon_os_onedir() {
         MINOR_VER_STRG="-$_GENERIC_PKG_VERSION"
     elif [ "$(echo "$STABLE_REV" | grep -E '^([3-9][0-5]{2}[6-9](\.[0-9]*)?)')" != "" ]; then
         # Minor version Salt, need to add specific minor version
-        STABLE_REV_DOT=$(echo "$STABLE_REV" | sed 's/-/\./')
+        STABLE_REV_DOT=$(__salt_version_string "$STABLE_REV")
         MINOR_VER_STRG="-$STABLE_REV_DOT"
     else
         # default to latest version Salt, config and repo already setup
@@ -6862,6 +7229,14 @@ install_vmware_photon_os_onedir() {
 
     if [ "$_INSTALL_SALT_API" -eq $BS_TRUE ]; then
         __PACKAGES="${__PACKAGES} salt-api$MINOR_VER_STRG"
+    fi
+
+    if [ "$_INSTALL_SSH" -eq $BS_TRUE ]; then
+        __PACKAGES="${__PACKAGES} salt-ssh$MINOR_VER_STRG"
+    fi
+
+    if [ "$_INSTALL_PROXY" -eq $BS_TRUE ]; then
+        __PACKAGES="${__PACKAGES} salt-proxy$MINOR_VER_STRG"
     fi
 
     # shellcheck disable=SC2086
@@ -6945,7 +7320,7 @@ __check_and_refresh_suse_pkg_repo() {
                 fi
             elif [ "$(echo "$ONEDIR_REV" | grep -E '^([3-9][0-5]{2}[6-9](\.[0-9]*)?)')" != "" ]; then
                 # using minor version
-                ONEDIR_REV_DOT=$(echo "$ONEDIR_REV" | sed 's/-/\./')
+                ONEDIR_REV_DOT=$(__salt_version_string "$ONEDIR_REV")
                 echo "[salt-repo-${ONEDIR_REV_DOT}-lts]" > "${ZYPPER_REPO_FILE}"
                 echo "name=Salt Repo for Salt v${ONEDIR_REV_DOT} LTS" >> "${ZYPPER_REPO_FILE}"
                 echo "baseurl=https://${_REPO_URL}/saltproject-rpm/" >> "${ZYPPER_REPO_FILE}"
@@ -7109,7 +7484,7 @@ install_opensuse_stable() {
         MINOR_VER_STRG=""
     elif [ "$(echo "$STABLE_REV" | grep -E '^([3-9][0-5]{2}[6-9](\.[0-9]*)?)')" != "" ]; then
         # Minor version Salt, need to add specific minor version
-        STABLE_REV_DOT=$(echo "$STABLE_REV" | sed 's/-/\./')
+        STABLE_REV_DOT=$(__salt_version_string "$STABLE_REV")
         MINOR_VER_STRG="-$STABLE_REV_DOT"
     else
         MINOR_VER_STRG=""
@@ -7132,6 +7507,14 @@ install_opensuse_stable() {
 
     if [ "$_INSTALL_SALT_API" -eq $BS_TRUE ]; then
         __PACKAGES="${__PACKAGES} salt-api$MINOR_VER_STRG"
+    fi
+
+    if [ "$_INSTALL_SSH" -eq $BS_TRUE ]; then
+        __PACKAGES="${__PACKAGES} salt-ssh$MINOR_VER_STRG"
+    fi
+
+    if [ "$_INSTALL_PROXY" -eq $BS_TRUE ]; then
+        __PACKAGES="${__PACKAGES} salt-proxy$MINOR_VER_STRG"
     fi
 
     # shellcheck disable=SC2086
@@ -7978,7 +8361,7 @@ __macosx_get_packagesite_onedir() {
         # need to get latest for major version
         __macosx_get_packagesite_onedir_latest "$_ONEDIR_REV" || return 1
     elif [ "$(echo "$_ONEDIR_REV" | grep -E '^([3-9][0-9]{3}(\.[0-9]*)?)')" != "" ]; then
-        _PKG_VERSION=$_ONEDIR_REV
+        _PKG_VERSION=$(__salt_version_string "$_ONEDIR_REV")
     else
         # default to getting latest
         __macosx_get_packagesite_onedir_latest || return 1
@@ -8117,6 +8500,284 @@ install_macosx_restart_daemons() {
 }
 #
 #   Ended OS X / Darwin Install Functions
+#
+#######################################################################################################################
+
+#######################################################################################################################
+#
+#   ALT Linux Install Functions
+#
+
+install_alt_linux_git_deps() {
+
+    if [ -n "$_PY_EXE" ] && [ "$_PY_MAJOR_VERSION" -ne 3 ]; then
+        echoerror "Python version is no longer supported, only Python 3"
+        return 1
+    fi
+
+    apt-get update || return 1
+
+    __PACKAGES=""
+    if ! __check_command_exists ps; then
+        __PACKAGES="${__PACKAGES} procps"
+    fi
+    if ! __check_command_exists git; then
+        __PACKAGES="${__PACKAGES} git"
+    fi
+
+    if [ -n "${__PACKAGES}" ]; then
+        # shellcheck disable=SC2086
+        __apt_get_install_noinput ${__PACKAGES} || return 1
+        __PACKAGES=""
+    fi
+
+    # shellcheck disable=SC2119
+    __git_clone_and_checkout || return 1
+
+    __PACKAGES="python${PY_PKG_VER}-dev python${PY_PKG_VER}-module-pip python${PY_PKG_VER}-module-pygit2"
+    __PACKAGES="${__PACKAGES} python${PY_PKG_VER}-module-setuptools gcc gcc-c++"
+
+    # shellcheck disable=SC2086
+    __apt_get_install_noinput ${__PACKAGES} || return 1
+
+    # Let's trigger config_salt()
+    if [ "$_TEMP_CONFIG_DIR" = "null" ]; then
+        _TEMP_CONFIG_DIR="${_SALT_GIT_CHECKOUT_DIR}/conf"
+        CONFIG_SALT_FUNC="config_salt"
+    fi
+
+    return 0
+}
+
+install_alt_linux_deps() {
+
+    if [ "$_UPGRADE_SYS" -eq $BS_TRUE ]; then
+        apt-get update || return 1
+        apt-get -y dist-upgrade || return 1
+    fi
+
+    __PACKAGES="${__PACKAGES:=}"
+    if [ -n "$_PY_EXE" ] && [ "$_PY_MAJOR_VERSION" -ne 3 ]; then
+        echoerror "Python version is no longer supported, only Python 3"
+        return 1
+    fi
+
+    PY_PKG_VER=3
+
+    __PACKAGES="${__PACKAGES} python${PY_PKG_VER} procps"
+    __PACKAGES="${__PACKAGES} python${PY_PKG_VER}-module-yaml python${PY_PKG_VER}-module-jinja2"
+    __PACKAGES="${__PACKAGES} python${PY_PKG_VER}-module-msgpack python${PY_PKG_VER}-module-cryptography"
+    __PACKAGES="${__PACKAGES} python${PY_PKG_VER}-module-zmq python${PY_PKG_VER}-module-pip"
+
+    if [ "${_EXTRA_PACKAGES}" != "" ]; then
+        echoinfo "Installing the following extra packages as requested: ${_EXTRA_PACKAGES}"
+    fi
+
+    # shellcheck disable=SC2086
+    __apt_get_install_noinput ${__PACKAGES} ${_EXTRA_PACKAGES} || return 1
+
+    return 0
+}
+
+install_alt_linux_onedir_deps() {
+    __wait_for_apt apt-get update || return 1
+    __apt_get_install_noinput wget tar gzip gnupg ca-certificates || return 1
+    return 0
+}
+
+install_alt_linux_stable() {
+
+    __PACKAGES=""
+
+    if [ "$_INSTALL_MASTER" -eq $BS_TRUE ]; then
+        __PACKAGES="${__PACKAGES} salt-master"
+    fi
+    if [ "$_INSTALL_MINION" -eq $BS_TRUE ]; then
+        __PACKAGES="${__PACKAGES} salt-minion"
+    fi
+    if [ "$_INSTALL_SALT_API" -eq $BS_TRUE ]; then
+        __PACKAGES="${__PACKAGES} salt-api"
+    fi
+
+    # shellcheck disable=SC2086
+    __apt_get_install_noinput ${__PACKAGES} || return 1
+
+    return 0
+}
+
+install_alt_linux_post() {
+
+    SYSTEMD_RELOAD=$BS_FALSE
+
+    for fname in api master minion syndic; do
+        # Skip salt-api since the service should be opt-in and not necessarily started on boot
+        [ $fname = "api" ] && continue
+
+        # Skip if not meant to be installed
+        [ $fname = "master" ] && [ "$_INSTALL_MASTER" -eq $BS_FALSE ] && continue
+        [ $fname = "minion" ] && [ "$_INSTALL_MINION" -eq $BS_FALSE ] && continue
+
+        if [ "$_SYSTEMD_FUNCTIONAL" -eq $BS_TRUE ]; then
+            /bin/systemctl is-enabled salt-${fname}.service > /dev/null 2>&1 || (
+                /bin/systemctl preset salt-${fname}.service > /dev/null 2>&1 &&
+                /bin/systemctl enable salt-${fname}.service > /dev/null 2>&1
+            )
+        fi
+    done
+
+    if [ "$SYSTEMD_RELOAD" -eq $BS_TRUE ]; then
+        /bin/systemctl daemon-reload
+    fi
+
+    return 0
+}
+
+install_alt_linux_git() {
+    install_fedora_git || return 1
+    return 0
+}
+
+install_alt_linux_git_post() {
+
+    for fname in api master minion syndic; do
+        # Skip if not meant to be installed
+        [ $fname = "api" ] && \
+            ([ "$_INSTALL_MASTER" -eq $BS_FALSE ] || ! __check_command_exists "salt-${fname}") && continue
+        [ $fname = "master" ] && [ "$_INSTALL_MASTER" -eq $BS_FALSE ] && continue
+        [ $fname = "minion" ] && [ "$_INSTALL_MINION" -eq $BS_FALSE ] && continue
+        [ $fname = "syndic" ] && [ "$_INSTALL_SYNDIC" -eq $BS_FALSE ] && continue
+
+        # Account for new path for services files in later releases
+        if [ -f "${_SALT_GIT_CHECKOUT_DIR}/pkg/common/salt-${fname}.service" ]; then
+          _SERVICE_DIR="${_SALT_GIT_CHECKOUT_DIR}/pkg/common"
+        else
+          _SERVICE_DIR="${_SALT_GIT_CHECKOUT_DIR}/pkg/rpm"
+        fi
+        __copyfile "${_SERVICE_DIR}/salt-${fname}.service" "/lib/systemd/system/salt-${fname}.service"
+
+        # Skip salt-api since the service should be opt-in and not necessarily started on boot
+        [ $fname = "api" ] && continue
+
+        systemctl is-enabled salt-$fname.service || (systemctl preset salt-$fname.service && systemctl enable salt-$fname.service)
+        sleep 1
+        systemctl daemon-reload
+
+    done
+}
+
+install_alt_linux_onedir() {
+    version="${ONEDIR_REV:-latest}"
+    arch="x86_64"
+    # Onedir tarball filenames use "arm64", not the "aarch64" uname reports.
+    [ "$(uname -m)" = "aarch64" ] && arch="arm64"
+
+    # Resolve "latest", or a bare major version (e.g. "3006"), to the actual
+    # latest GA release for that series via the artifactory directory listing
+    # (same mechanism used for macOS/Windows/Photon onedir installs). A full
+    # version string (e.g. "3006.26") is used as-is.
+    if [ "$version" = "latest" ]; then
+        __get_packagesite_onedir_latest || return 1
+        version="$_GENERIC_PKG_VERSION"
+    elif [ "$(echo "$version" | grep -E '^[0-9]{4}$')" != "" ]; then
+        __get_packagesite_onedir_latest "$version" || return 1
+        version="$_GENERIC_PKG_VERSION"
+    else
+        version=$(__salt_version_string "$version")
+    fi
+
+    tarball="salt-${version}-onedir-linux-${arch}.tar.xz"
+    # GitHub Releases doesn't carry an onedir tarball asset for every
+    # historical point release (only newer ones do), while the artifactory
+    # generic repo has the complete history - it's the same source already
+    # used by the macOS/Windows/Photon onedir installers, and by the CI
+    # images' own provisioning.
+    url="https://${_REPO_URL}/saltproject-generic/onedir/${version}/${tarball}"
+    extractdir="/opt/saltstack/salt"
+
+    echoinfo "Downloading Salt onedir: $url"
+    wget -q "$url" -O "/tmp/${tarball}" || return 1
+
+    # Validate tarball
+    if ! tar -tf "/tmp/${tarball}" >/dev/null 2>&1; then
+        echoerror "Invalid or corrupt onedir tarball"
+        return 1
+    fi
+
+    # Prepare extraction
+    rm -rf /opt/saltstack/salt || true
+    mkdir -p "${extractdir}"
+    tar --strip-components=1 -xf "/tmp/${tarball}" -C "$extractdir" || return 1
+
+    chmod -R 755 "${extractdir}"
+
+    return 0
+}
+
+install_alt_linux_onedir_post() {
+
+    # Add onedir paths system-wide. This only takes effect for login/interactive
+    # shells that source /etc/profile.d - it does not help something like
+    # `docker exec <container> salt-call ...`, which runs without one, so also
+    # symlink the onedir binaries into /usr/bin, already on PATH everywhere.
+    cat >/etc/profile.d/saltstack.sh <<'EOF'
+export PATH=/opt/saltstack/salt:/opt/saltstack/salt/bin:$PATH
+EOF
+
+    chmod 644 /etc/profile.d/saltstack.sh
+
+    for bin in /opt/saltstack/salt/salt*; do
+        [ -f "$bin" ] && [ -x "$bin" ] && ln -sf "$bin" "/usr/bin/$(basename "$bin")"
+    done
+
+    for fname in api master minion syndic; do
+        # Skip salt-api since the service should be opt-in and not necessarily started on boot
+        [ $fname = "api" ] && continue
+
+        # Skip if not meant to be installed
+        [ $fname = "master" ] && [ "$_INSTALL_MASTER" -eq $BS_FALSE ] && continue
+        [ $fname = "minion" ] && [ "$_INSTALL_MINION" -eq $BS_FALSE ] && continue
+        [ $fname = "syndic" ] && [ "$_INSTALL_SYNDIC" -eq $BS_FALSE ] && continue
+
+        systemctl disable --now "salt-${fname}.service" 2>/dev/null || true
+
+        cat >"/etc/systemd/system/salt-${fname}.service" <<EOF
+[Unit]
+Description=Salt ${fname} (onedir)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/saltstack/salt/salt-${fname} -c /etc/salt
+Restart=always
+LimitNOFILE=100000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+        if [ "$_START_DAEMONS" -eq $BS_TRUE ]; then
+            systemctl enable --now "salt-${fname}.service"
+        fi
+    done
+
+    systemctl daemon-reload
+
+    return 0
+}
+
+install_alt_linux_restart_daemons() {
+    install_fedora_restart_daemons || return 1
+    return 0
+}
+
+install_alt_linux_check_services() {
+    install_fedora_check_services || return 1
+    return 0
+}
+
+#
+#   Ended ALT Linux Install Functions
 #
 #######################################################################################################################
 
@@ -8625,6 +9286,17 @@ fi
 # Install Salt
 if [ "$_CONFIG_ONLY" -eq $BS_FALSE ]; then
     # Only execute function is not in config mode only
+
+    # The packages on some distributions start the services as soon as they are installed. When there are packages to
+    # install with -e, hold that back until they are in place, see __start_guard_needed.
+    if __start_guard_needed; then
+        echoinfo "Preventing Salt services from starting until the packages from ${_PIP_REQUIREMENTS_FILE} are installed"
+        if ! __service_start_guard_on; then
+            echoerror "Failed to prevent Salt services from starting during installation"
+            exit 1
+        fi
+    fi
+
     echoinfo "Running ${INSTALL_FUNC}()"
     if ! ${INSTALL_FUNC}; then
         echoerror "Failed to run ${INSTALL_FUNC}()!!!"
@@ -8639,6 +9311,21 @@ if [ "$POST_INSTALL_FUNC" != "null" ] && [ "$_CONFIG_ONLY" -eq $BS_FALSE ]; then
         echoerror "Failed to run ${POST_INSTALL_FUNC}()!!!"
         exit 1
     fi
+fi
+
+# Install the PyPI packages requested with -e. This has to happen after Salt is installed, since it needs salt-pip, and
+# before the services are started so the packages are available the first time Salt runs.
+if [ "$_PIP_REQUIREMENTS_FILE" != "null" ] && [ "$_CONFIG_ONLY" -eq $BS_FALSE ]; then
+    echoinfo "Running __install_pip_requirements()"
+    if ! __install_pip_requirements; then
+        echoerror "Failed to run __install_pip_requirements()!!!"
+        exit 1
+    fi
+fi
+
+# Services may start again now that everything they need is installed
+if [ "$_START_GUARD_ACTIVE" -eq $BS_TRUE ]; then
+    __service_start_guard_off
 fi
 
 # Run any check services function, Only execute function if not in config mode only

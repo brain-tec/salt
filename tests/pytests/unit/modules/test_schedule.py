@@ -9,6 +9,7 @@ from collections import OrderedDict
 import pytest
 
 import salt.modules.schedule as schedule
+import salt.utils.yaml
 from salt.utils.event import SaltEvent
 from tests.support.mock import MagicMock, call, mock_open, patch
 
@@ -338,7 +339,22 @@ def test_add():
                 ) == {"comment": comm1, "changes": changes1, "result": True}
 
                 _call = call(
-                    b"schedule:\n  job3: {function: test.ping, seconds: 3600, maxrunning: 1, name: job3, enabled: true,\n    jid_include: true}\n"
+                    salt.utils.yaml.safe_dump(
+                        {
+                            "schedule": {
+                                "job3": OrderedDict(
+                                    [
+                                        ("function", "test.ping"),
+                                        ("seconds", 3600),
+                                        ("maxrunning", 1),
+                                        ("name", "job3"),
+                                        ("enabled", True),
+                                        ("jid_include", True),
+                                    ],
+                                ),
+                            },
+                        }
+                    ).encode()
                 )
                 write_calls = fopen_mock.filehandles[schedule_config_file][
                     1
@@ -1292,3 +1308,46 @@ def test_list_global_disabled(job1):
         ) as fopen_mock:
             ret = schedule.list_()
             assert ret == expected
+
+
+# 'postpone_job' error-log regression tests: 2
+
+
+def test_postpone_job_invalid_current_time_logs_current_time(caplog):
+    """
+    When current_time cannot be parsed, the error log must reference current_time,
+    not new_time.  Regression test for the copy-paste bug fixed in #68988.
+    """
+    with caplog.at_level(logging.ERROR, logger="salt.modules.schedule"):
+        ret = schedule.postpone_job(
+            "job1",
+            current_time="not-a-date",
+            new_time="2099-01-01T00:00:00",
+        )
+    assert ret["result"] is False
+    assert ret["comment"] == "Date string could not be parsed."
+    # The log message must contain the bad current_time value, not new_time.
+    assert any(
+        "not-a-date" in r.message for r in caplog.records
+    ), "Error log did not mention the unparsable current_time value"
+    assert not any(
+        "2099-01-01T00:00:00" in r.message for r in caplog.records
+    ), "Error log mentioned new_time instead of current_time"
+
+
+def test_postpone_job_invalid_new_time_logs_new_time(caplog):
+    """
+    When new_time cannot be parsed, the error log must reference new_time.
+    Ensures the sibling log call (which was already correct) stays correct.
+    """
+    with caplog.at_level(logging.ERROR, logger="salt.modules.schedule"):
+        ret = schedule.postpone_job(
+            "job1",
+            current_time="2099-01-01T00:00:00",
+            new_time="not-a-date",
+        )
+    assert ret["result"] is False
+    assert ret["comment"] == "Date string could not be parsed."
+    assert any(
+        "not-a-date" in r.message for r in caplog.records
+    ), "Error log did not mention the unparsable new_time value"

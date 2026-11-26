@@ -9,6 +9,7 @@ module can be overwritten just by returning dict keys with the same value
 as those returned here
 """
 
+import concurrent.futures
 import datetime
 import hashlib
 import locale
@@ -297,7 +298,18 @@ def _linux_gpu_data():
 
     devs = []
     try:
-        lspci_out = __salt__["cmd.run"](f"{lspci} -vmm")
+        # Run lspci directly (not via cmd.run) with a short timeout so a
+        # hung lspci -- e.g. inside a container without a live PCI bus --
+        # cannot leak orphan child processes on every grains refresh.
+        # On timeout subprocess.run kills the child before re-raising.
+        proc = subprocess.run(
+            [lspci, "-vmm"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        lspci_out = proc.stdout
 
         cur_dev = {}
         error = False
@@ -325,6 +337,13 @@ def _linux_gpu_data():
                 "check that you have a valid shell configured and "
                 "permissions to run lspci command"
             )
+    except subprocess.TimeoutExpired:
+        log.warning(
+            "The `lspci` command timed out while collecting GPU grains. "
+            "GPU grains will not be available. Set `enable_gpu_grains: "
+            "False` in the minion config to skip this collection entirely."
+        )
+        return {}
     except OSError:
         pass
 
@@ -2856,7 +2875,7 @@ def os_data():
         grains["osfullname"] = "{} {}".format(grains["kernel"], grains["osrelease"])
         grains.update(_bsd_cpudata(grains))
     elif grains["kernel"] in ("OpenBSD", "NetBSD"):
-        grains["os_family"] = grains["os"] = grains["kernel"]
+        grains["os_family"] = grains["osfullname"] = grains["os"] = grains["kernel"]
         grains.update(_bsd_cpudata(grains))
         grains["osrelease"] = grains["kernelrelease"].split("-")[0]
         grains["osfullname"] = "{} {}".format(grains["kernel"], grains["osrelease"])
@@ -2985,24 +3004,13 @@ def fqdns():
     """
     Return all known FQDNs for the system by enumerating all interfaces and
     then trying to reverse resolve them (excluding 'lo' interface).
-    To disable the fqdns grain, set enable_fqdns_grains: False in the minion configuration file.
+    To disable the fqdns grain, add "fqdns" to "disabled_grains" in the minion
+    configuration file.
     """
     # Provides:
     # fqdns
     opt = {"fqdns": []}
-    if __opts__.get(
-        "enable_fqdns_grains",
-        (
-            False
-            if salt.utils.platform.is_windows()
-            or salt.utils.platform.is_proxy()
-            or salt.utils.platform.is_sunos()
-            or salt.utils.platform.is_aix()
-            or salt.utils.platform.is_junos()
-            or salt.utils.platform.is_darwin()
-            else True
-        ),
-    ):
+    if "fqdns" not in __opts__.get("disabled_grains", []):
         opt = __salt__["network.fqdns"]()
     return opt
 
@@ -3019,14 +3027,30 @@ def ip_fqdn():
     ret["ipv6"] = salt.utils.network.ip_addrs6(include_loopback=True)
 
     _fqdn = hostname()["fqdn"]
+    # ``socket.getaddrinfo`` has no Python-level timeout.  On macOS (and
+    # any host whose resolver can't answer for its own hostname) this
+    # blocks for the full OS timeout per address family -- up to ~25s on
+    # macOS when the hostname is a ``.local`` mDNS name.  Wrap each
+    # family's lookup in a bounded thread so a stuck resolver can't stall
+    # grain refresh (which, on the master, happens during ``salt-master``
+    # startup).  See #62168.
+    fqdn_resolution_timeout = 5
     for socket_type, ipv_num in ((socket.AF_INET, "4"), (socket.AF_INET6, "6")):
         key = "fqdn_ip" + ipv_num
         if not ret["ipv" + ipv_num]:
             ret[key] = []
         else:
             start_time = datetime.datetime.now(tz=datetime.timezone.utc)
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             try:
-                info = socket.getaddrinfo(_fqdn, None, socket_type)
+                future = pool.submit(socket.getaddrinfo, _fqdn, None, socket_type)
+                try:
+                    info = future.result(timeout=fqdn_resolution_timeout)
+                except concurrent.futures.TimeoutError:
+                    raise OSError(
+                        f"getaddrinfo exceeded {fqdn_resolution_timeout}s"
+                        f" for {_fqdn!r}"
+                    )
                 ret[key] = list({item[4][0] for item in info})
             except (OSError, UnicodeError):
                 timediff = datetime.datetime.now(tz=datetime.timezone.utc) - start_time
@@ -3041,6 +3065,11 @@ def ip_fqdn():
                         ipv_num,
                     )
                 ret[key] = []
+            finally:
+                # Don't wait for a potentially-stuck ``getaddrinfo`` worker
+                # on shutdown -- the system call can't be cancelled, so
+                # block only on the timeout above.
+                pool.shutdown(wait=False, cancel_futures=True)
 
     return ret
 
@@ -3200,7 +3229,19 @@ def pythonversion():
     """
     # Provides:
     #   pythonversion
-    return {"pythonversion": list(sys.version_info)}
+    #   pythonrelease
+    #   pythonrelease_info
+    #
+    # ``pythonversion`` is a list rather than a dotted string, which is
+    # inconsistent with the ``<foo>release`` / ``<foo>release_info`` pair used
+    # by the other version grains (e.g. ``osrelease`` / ``osrelease_info``).
+    # ``pythonrelease`` and ``pythonrelease_info`` follow that convention;
+    # ``pythonversion`` is kept unchanged for backwards compatibility.
+    return {
+        "pythonversion": list(sys.version_info),
+        "pythonrelease": platform.python_version(),
+        "pythonrelease_info": list(sys.version_info),
+    }
 
 
 def pythonpath():
@@ -3620,6 +3661,23 @@ def get_master():
     # Provides:
     #   master
     return {"master": __opts__.get("master", "")}
+
+
+def master_cluster_id():
+    """
+    Return the ``master_cluster_id`` grain, populated from the master's
+    auth response (``opts["master_cluster_id"]``).
+
+    Returns an empty dict (no grain) when the field is absent --- i.e.
+    when the master is not topology-enabled or has opted out of
+    publishing the grain via ``topology_push_cluster_grain: False``.
+    """
+    # Provides:
+    #   master_cluster_id
+    cluster_id = __opts__.get("master_cluster_id")
+    if not cluster_id:
+        return {}
+    return {"master_cluster_id": cluster_id}
 
 
 def default_gateway():

@@ -40,7 +40,8 @@ That identity material can be provided in one of two ways:
   over the cluster transport before being promoted to a Raft voter, and
   job/cache state moves between masters via the Raft+HashRing layer.  See
   the :ref:`Topology section <master-cluster-topology>` for a side-by-side
-  comparison.
+  comparison, and :ref:`cache-rings` for how to shard a cache across
+  masters using the HashRing layer.
 
 Each master in a cluster maintains its own public and private key, and an in
 memory aes key. Each cluster peer also has access to the ``cluster_pki_dir``
@@ -48,6 +49,11 @@ where a cluster-wide public and private key are stored. In addition, the
 cluster-wide aes key is generated and stored in the ``cluster_pki_dir``.
 Further, when operating as a cluster, minion keys are stored in the
 ``cluster_pki_dir`` instead of the master's ``pki_dir``.
+
+Each master should set :conf_master:`id` to a unique value that is the same
+name its siblings specify in ``cluster_peers``. It should be set
+to a hostname or IP address that is reachable by all other masters in the
+cluster. See :conf_master:`cluster_peers` for the details.
 
 .. _master-cluster-topology:
 
@@ -81,7 +87,7 @@ identical.
         ``salt-run cluster.sync_roots``
     * - Job / grain cache routing
       - Through the shared cachedir
-      - Through Raft + HashRing
+      - Through Raft + HashRing (see :ref:`cache-rings`)
     * - Recommended :conf_master:`keys.cache_driver`
       - ``localfs_key`` (default)
       - ``mmap_key`` (see :ref:`mmap-cache`)
@@ -109,6 +115,14 @@ want to join.
 
 Reference Implementation
 ========================
+
+.. seealso::
+
+    For copy-pasteable 2-node and 3-node walkthroughs using the
+    isolated-filesystem mode, plus a complete HAProxy configuration
+    and the trade-offs of round-robin vs. sticky-session load
+    balancing in front of a cluster, see
+    :ref:`tutorial-master-cluster-reference`.
 
 Gluster: https://docs.gluster.org/en/main/Quick-Start-Guide/Quickstart/
 
@@ -282,6 +296,10 @@ one master at a time.
 
         salt-run cluster.members
         salt-run cluster.ring_info
+
+    See :ref:`cache-rings` for the full set of ring-inspection runners
+    (``cluster.rings``, ``cluster.routes``, ``cluster.shed_status``) and
+    for how to shard a cache across the cluster.
 
     ``cluster.members`` shows every Raft voter (and any learners that
     haven't caught up yet).  ``cluster.ring_info`` shows the HashRing

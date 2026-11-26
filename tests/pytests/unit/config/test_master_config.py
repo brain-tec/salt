@@ -5,7 +5,7 @@ from tests.support.mock import MagicMock, patch
 
 
 def test_apply_no_cluster_id():
-    defaults = salt.config.DEFAULT_MASTER_OPTS.copy()
+    defaults = salt.config.DEFAULT_MASTER_OPTS.copy() | {"id": "config-test-master"}
     assert defaults["cluster_id"] is None
 
     overrides = {}
@@ -20,7 +20,7 @@ def test_apply_no_cluster_id():
 
 
 def test_apply_default_for_cluster():
-    defaults = salt.config.DEFAULT_MASTER_OPTS.copy()
+    defaults = salt.config.DEFAULT_MASTER_OPTS.copy() | {"id": "config-test-master"}
     assert defaults["cluster_id"] is None
 
     overrides = {"cluster_id": "test-cluster"}
@@ -43,7 +43,7 @@ def test_apply_default_for_cluster():
 
 
 def test_apply_for_cluster():
-    defaults = salt.config.DEFAULT_MASTER_OPTS.copy()
+    defaults = salt.config.DEFAULT_MASTER_OPTS.copy() | {"id": "config-test-master"}
     assert defaults["cluster_id"] is None
 
     cluster_dir = "/tmp/cluster"
@@ -87,7 +87,7 @@ def test_cluster_port_alias_warns_and_aliases_cluster_pool_port(caplog):
     ``cluster_pool_port`` (if the caller did not set that explicitly) and
     emits a deprecation warning.
     """
-    defaults = salt.config.DEFAULT_MASTER_OPTS.copy()
+    defaults = salt.config.DEFAULT_MASTER_OPTS.copy() | {"id": "config-test-master"}
     overrides = {"cluster_port": 6520}
 
     with caplog.at_level(logging.WARNING, logger="salt.config"):
@@ -107,7 +107,7 @@ def test_cluster_pool_port_wins_over_cluster_port_alias():
     for operators who happened to pick up the buggy name, not a co-equal
     setting.
     """
-    defaults = salt.config.DEFAULT_MASTER_OPTS.copy()
+    defaults = salt.config.DEFAULT_MASTER_OPTS.copy() | {"id": "config-test-master"}
     overrides = {"cluster_port": 55596, "cluster_pool_port": 6520}
 
     opts = salt.config.apply_master_config(overrides, defaults)
@@ -115,7 +115,7 @@ def test_cluster_pool_port_wins_over_cluster_port_alias():
 
 
 def test___cli_path_is_expanded():
-    defaults = salt.config.DEFAULT_MASTER_OPTS.copy()
+    defaults = salt.config.DEFAULT_MASTER_OPTS.copy() | {"id": "config-test-master"}
     overrides = {}
     with patch(
         "salt.utils.path.expand", MagicMock(return_value="/path/to/testcli")
@@ -123,3 +123,38 @@ def test___cli_path_is_expanded():
         opts = salt.config.apply_master_config(overrides, defaults)
         assert expand_mock.called
         assert opts["__cli"] == "testcli"
+
+
+def test_mminion_config_reuses_caller_grains(tmp_path):
+    """
+    ``mminion_config`` should reuse a grains dict the caller already
+    computed instead of running ``salt.loader.grains`` again -- otherwise
+    every ``MasterMinion`` instantiation (and there are many during
+    ``salt-master`` startup) repeats the full grain refresh.  See #62168.
+    """
+    conf_file = tmp_path / "minion"
+    conf_file.write_text("")
+    caller_grains = {"os": "Fake", "fqdns": ["cached.example.com"]}
+    overrides = {"conf_file": str(conf_file), "grains": caller_grains}
+    with patch("salt.loader.grains") as loader_grains:
+        opts = salt.config.mminion_config(str(conf_file), overrides)
+    assert loader_grains.call_count == 0, (
+        "salt.loader.grains should not be invoked when the caller already "
+        "supplied a populated grains dict"
+    )
+    assert opts["grains"] is caller_grains
+
+
+def test_mminion_config_computes_grains_when_caller_omits_them(tmp_path):
+    """
+    When no grains are provided, ``mminion_config`` must still compute
+    them via ``salt.loader.grains`` so first-time startup works.
+    """
+    conf_file = tmp_path / "minion"
+    conf_file.write_text("")
+    overrides = {"conf_file": str(conf_file)}
+    sentinel = {"os": "Sentinel"}
+    with patch("salt.loader.grains", return_value=sentinel) as loader_grains:
+        opts = salt.config.mminion_config(str(conf_file), overrides)
+    assert loader_grains.call_count == 1
+    assert opts["grains"] is sentinel

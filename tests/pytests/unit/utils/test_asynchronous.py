@@ -11,12 +11,73 @@ back every master-initiated job) raised
 """
 
 import asyncio
+import gc
+import warnings
 
 import pytest
 import tornado.gen
 import tornado.ioloop
 
+import salt.transport
+import salt.transport.tcp
 import salt.utils.asynchronous as asynchronous
+from tests.support.mock import patch
+
+
+@pytest.mark.parametrize("warn", [False, True])
+async def test_aioloop_preserves_native_loop_without_warning(warn):
+    loop = asyncio.get_running_loop()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        assert asynchronous.aioloop(loop, warn=warn) is loop
+
+
+def test_aioloop_tornado_deprecation_deadline(io_loop, monkeypatch):
+    monkeypatch.setenv("RAISE_DEPRECATIONS_RUNTIME_ERRORS", "1")
+    with patch("salt.version.__version_info__", (3009, 2)):
+        with pytest.raises(RuntimeError, match="Please remove the warning"):
+            asynchronous.aioloop(io_loop, warn=True)
+
+
+def test_sync_wrapper_passes_its_native_loop_to_constructor():
+    class NativeClient:
+        def __init__(self, io_loop):
+            self.io_loop = io_loop
+            self.current_loop = asyncio.get_event_loop()
+
+    with asynchronous.SyncWrapper(NativeClient, loop_kwarg="io_loop") as wrapper:
+        loop = wrapper.asyncio_loop
+        assert isinstance(wrapper.obj.io_loop, asyncio.AbstractEventLoop)
+        assert wrapper.obj.io_loop is wrapper.asyncio_loop
+        assert wrapper.obj.current_loop is wrapper.asyncio_loop
+    assert loop.is_closed()
+
+
+@pytest.mark.parametrize("transport", ["tcp", "zeromq", "ws"])
+def test_sync_wrapper_constructs_native_publish_clients(transport):
+    with asynchronous.SyncWrapper(
+        salt.transport.publish_client,
+        args=({"transport": transport},),
+        kwargs={"host": "127.0.0.1", "port": 4506},
+        loop_kwarg="io_loop",
+    ) as wrapper:
+        loop = wrapper.asyncio_loop
+        assert wrapper.obj.io_loop is loop
+        assert not loop.is_closed()
+    assert loop.is_closed()
+
+
+def test_sync_wrapper_constructs_native_tcp_ipc_publisher():
+    with asynchronous.SyncWrapper(
+        salt.transport.tcp._TCPPubServerPublisher,
+        args=("127.0.0.1", 4506, None),
+        loop_kwarg="io_loop",
+        close_methods=["close"],
+    ) as wrapper:
+        loop = wrapper.asyncio_loop
+        assert wrapper.obj.io_loop is loop
+        assert wrapper.obj.stream is None
+    assert loop.is_closed()
 
 
 class HelperA:
@@ -48,6 +109,34 @@ class HelperB:
         yield tornado.gen.sleep(0.1)
         self.a.sleep()
         raise tornado.gen.Return(False)
+
+
+async def test_cancel_tasks_drains_all_owned_cleanup():
+    started = [asyncio.Event(), asyncio.Event()]
+    cleaned = []
+
+    async def operation(index):
+        try:
+            started[index].set()
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0)
+            cleaned.append(index)
+            if index == 0:
+                raise OSError("cleanup failed")
+
+    tasks = [asyncio.create_task(operation(index)) for index in range(2)]
+    await asyncio.gather(*(event.wait() for event in started))
+    await asynchronous.cancel_tasks(*tasks)
+    assert sorted(cleaned) == [0, 1]
+    assert all(task.done() for task in tasks)
+
+
+async def test_cancel_tasks_accepts_current_missing_and_completed_tasks():
+    future = asyncio.get_running_loop().create_future()
+    future.set_exception(OSError("already failed"))
+    await asynchronous.cancel_tasks(None, asyncio.current_task(), future, future)
+    assert not asyncio.current_task().cancelled()
 
 
 class _LoopProbe:
@@ -156,3 +245,308 @@ def test_sync_wrapper_thread_has_asyncio_loop_65702():
         assert sync.check_loop() is True
     finally:
         sync.close()
+
+
+class _AsyncioTaskScheduler:
+    """
+    Async helper whose coroutine schedules a bare task on the asyncio
+    loop that ``SyncWrapper._target`` installed as ``current`` for the
+    worker thread -- mirrors what pyzmq's ``zmq.eventloop.future``
+    machinery and tornado's asyncio bridge do internally when a wrapped
+    coroutine touches a socket.  The scheduled task is not awaited
+    from within the tornado ``run_sync``: tornado drives its own
+    coroutine to completion, but any task landed on
+    ``SyncWrapper.asyncio_loop`` is never iterated because that loop
+    only ever has ``asyncio.set_event_loop`` called on it, never
+    ``run_forever`` / ``run_until_complete``.
+    """
+
+    async_methods = ["schedule_and_return"]
+
+    def __init__(self, io_loop=None):
+        pass
+
+    @tornado.gen.coroutine
+    def schedule_and_return(self):
+        async def _child():
+            # Never resolves within the outer ``run_sync`` window;
+            # models a background poll / socket-read coroutine that
+            # pyzmq's future-based sockets spawn and don't await
+            # from inside the wrapped call.
+            await asyncio.sleep(1000)
+            return 1
+
+        loop = asyncio.get_event_loop()
+        loop.create_task(_child())
+        raise tornado.gen.Return(True)
+
+
+def test_sync_wrapper_reaps_pending_tasks_after_run_sync():
+    """
+    Regression test for #70169: ``SyncWrapper._target`` installs
+    ``self.asyncio_loop`` as the current asyncio loop on its worker
+    thread but drives the wrapped coroutine through tornado's
+    ``io_loop.run_sync``.  Any ``asyncio.Task`` created inside the
+    wrapped coroutine on the asyncio-side is never iterated and pins
+    its coroutine + ``contextvars.Context`` until ``close()``.  Under
+    long-lived driver processes (``EventReturn``, ``BatchManager``)
+    that never call ``close()`` in steady state, the retention
+    accumulates for the process lifetime.
+    """
+    # Route through ``_target`` (the cross-thread dispatch path) by
+    # calling from inside a running asyncio loop -- that is the
+    # ``asyncio.get_running_loop()`` branch in ``_wrap`` that spawns a
+    # worker thread and calls ``asyncio.set_event_loop(asyncio_loop)``.
+    sync = asynchronous.SyncWrapper(_AsyncioTaskScheduler)
+    outer_loop = asyncio.new_event_loop()
+    try:
+
+        async def _driver():
+            for _ in range(50):
+                assert sync.schedule_and_return() is True
+
+        outer_loop.run_until_complete(_driver())
+        pending = [t for t in asyncio.all_tasks(sync.asyncio_loop) if not t.done()]
+        assert not pending, (
+            f"SyncWrapper leaked {len(pending)} pending asyncio Task(s) on its "
+            "asyncio_loop after 50 dispatches; each pins its coroutine + "
+            "contextvars.Context and is never garbage collected until close()"
+        )
+    finally:
+        outer_loop.close()
+        sync.close()
+
+
+class HelperPending:
+    """A helper whose wrapped coroutine leaves a task pending on the loop."""
+
+    async_methods = [
+        "start_background",
+    ]
+
+    def __init__(self, io_loop=None):
+        self.io_loop = io_loop
+
+    @tornado.gen.coroutine
+    def start_background(self):
+        # Leave a long-lived task behind on this wrapper's own loop, so
+        # ``close()`` has something to drain.
+        asyncio.ensure_future(asyncio.sleep(3600))
+        raise tornado.gen.Return(True)
+
+
+def test_close_drains_tasks_belonging_to_the_wrappers_own_loop():
+    """
+    ``close()`` runs outside the loop it is tearing down -- the calling
+    thread's current loop is a different one.  ``asyncio.gather`` no longer
+    takes a ``loop`` argument, so it resolves the loop from the calling
+    context, and on Python 3.14 gathering tasks that belong to another loop
+    raises ``ValueError: The future belongs to a different loop than the one
+    specified as the loop argument``.  Earlier versions took the loop from the
+    first future and let it through, so this surfaced as a wall of
+    "Error during asyncio shutdown" for every proxy minion on 3.14.
+
+    Building the gather inside the loop drains the tasks on every version.
+    """
+    sync = asynchronous.SyncWrapper(HelperPending)
+    sync.start_background()
+
+    pending = [t for t in asyncio.all_tasks(sync.asyncio_loop) if not t.done()]
+    assert pending, "expected a task pending on the wrapper's loop"
+
+    # The failure only happens when ``close()`` is called from inside a
+    # *different running* loop, which is how it is reached in a proxy minion:
+    # ``asyncio.gather`` then resolves the running loop rather than the tasks'
+    # own loop and rejects them.  Drive it that way.
+    #
+    # Asserting on the tasks alone would not catch this either -- they are
+    # cancelled before the gather, so they end up done() regardless.  The
+    # symptom is the swallowed exception, so assert nothing was logged.
+    async def _close_from_another_running_loop():
+        with patch.object(asynchronous.log, "error") as log_error:
+            sync.close()
+        return log_error.call_args_list
+
+    driver = asyncio.new_event_loop()
+    try:
+        errors = driver.run_until_complete(_close_from_another_running_loop())
+    finally:
+        driver.close()
+
+    # Only the swallowed exception is asserted on here.  That the tasks are
+    # actually driven to completion is covered by
+    # test_close_from_running_loop_runs_pending_tasks_to_completion_70353.
+    assert not errors, errors
+
+
+class HelperHeldTask:
+    """
+    A helper that leaves a task on the wrapper's own loop and keeps a
+    reference to it, so ``_target``'s orphan reaper leaves it alone and only
+    ``close()`` can clean it up.  This is the shape of the
+    ``AsyncAuth._authenticate`` task in #70353, which on Python 3.12+ is
+    referenced by the ``asyncio.Timeout`` of the ``wait_for`` it is
+    suspended in.
+
+    The attributes are slots because the reaper ignores referrers that are
+    containers.  Before Python 3.11, ``gc.get_referrers`` reports a plain
+    instance attribute as held by the instance ``__dict__``, a ``dict``, and
+    on 3.10 the reaper then cancels the task before ``close()`` is reached.
+    A slot is reported as held by the instance on every version.
+    """
+
+    __slots__ = ("task", "cleaned_up")
+
+    async_methods = [
+        "start_background",
+    ]
+
+    def __init__(self, io_loop=None):
+        self.task = None
+        self.cleaned_up = False
+
+    async def _background(self):
+        try:
+            await asyncio.sleep(3600)
+        finally:
+            # Stands in for ``RequestClient.close_async`` closing its ZMQ
+            # socket once the task is cancelled.
+            self.cleaned_up = True
+
+    async def start_background(self):
+        self.task = asyncio.ensure_future(self._background())
+        return True
+
+
+def test_close_from_running_loop_runs_pending_tasks_to_completion_70353():
+    """
+    In #70353, ``Minion.handle_event`` (a coroutine on the minion's loop)
+    called the synchronous ``_mine_send``, which used a ``SyncWrapper`` and
+    closed it while the minion's loop was running in the same thread.
+    ``close()`` cancelled the tasks left on the wrapper's loop but could not
+    run that loop to let them finish (``run_until_complete`` refuses to run
+    while another loop is running in the thread), then closed it.  The cancelled
+    coroutines never resumed, so the ZMQ sockets they held were never closed
+    and a later GC pass deadlocked the minion in ``zmq_ctx_term()``.
+    """
+    sync = asynchronous.SyncWrapper(HelperHeldTask)
+    obj = sync.obj
+
+    async def _use_and_close_from_running_loop():
+        assert sync.start_background() is True
+        assert not obj.task.done()
+        sync.close()
+
+    driver = asyncio.new_event_loop()
+    try:
+        driver.run_until_complete(_use_and_close_from_running_loop())
+    finally:
+        driver.close()
+
+    assert obj.task.done()
+    assert obj.task.cancelled()
+    assert obj.cleaned_up is True
+
+
+def test_syncwrapper_del_safety_net_calls_close_70175():
+    """
+    Regression test for the __del__ safety-net cleanup extension of #70175.
+
+    When a caller drops the last reference to a ``SyncWrapper`` without
+    invoking ``close()`` or using it as a context manager, the ``__del__``
+    finalizer must:
+
+    1. Emit the ``ResourceWarning`` so the leaky caller still surfaces for
+       tracking (behavior preserved from the warn-only revision).
+    2. Fall back to ``close()`` so the wrapped ``obj`` is released and the
+       owned ``asyncio.new_event_loop()`` is actually closed -- otherwise
+       every abandoned wrapper leaks a whole IOLoop + ZMQ context +
+       socketpairs, which is the observed ~50 MB/hr RSS growth on the
+       minion.
+    """
+    sync = asynchronous.SyncWrapper(HelperA)
+    asyncio_loop = sync.asyncio_loop
+    assert not asyncio_loop.is_closed()
+    assert sync.obj is not None
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        del sync
+        gc.collect()
+
+    # 1. ResourceWarning still fires.
+    resource_warnings = [w for w in caught if issubclass(w.category, ResourceWarning)]
+    assert resource_warnings, (
+        "expected ResourceWarning from SyncWrapper.__del__; got "
+        f"{[(w.category, str(w.message)) for w in caught]}"
+    )
+    assert any("unclosed SyncWrapper" in str(w.message) for w in resource_warnings)
+
+    # 2. Safety-net close() ran: the underlying asyncio loop is now closed.
+    #    Without the safety-net, ``asyncio_loop.is_closed()`` stays False
+    #    forever because nothing else has a handle on it -- it leaks as a
+    #    dangling loop object with its selector, kqueue/epoll fd, and any
+    #    tornado bridging state.  ``close()`` is the only place that drives
+    #    ``self.asyncio_loop.close()``.
+    assert (
+        asyncio_loop.is_closed()
+    ), "SyncWrapper.__del__ safety-net did not drive asyncio_loop.close()"
+
+
+def test_syncwrapper_del_forked_child_does_not_touch_parent_resources_70175(
+    monkeypatch,
+):
+    """
+    Regression test for fork-safety of the __del__ safety-net cleanup.
+
+    Reproduces the failure mode observed in
+    tests/pytests/unit/utils/event/test_event.py::test_event_no_timeout:
+    ``EventSender`` forks a child process which inherits the parent's
+    ``MasterEvent`` -> ``SyncWrapper`` -> ``ipc_publish_client`` (which
+    wraps a real socket FD).  When the child exits, GC calls the
+    inherited wrapper's ``__del__``; without the ``_creator_pid`` guard,
+    that ``__del__`` fires ``close()`` on the shared socket FD, breaking
+    the parent's transport (``recv()`` in the parent then blocks forever
+    waiting on an event bus with no live connection).
+
+    Guard contract:
+
+    - ``__init__`` records ``self._creator_pid = os.getpid()``.
+    - ``__del__`` short-circuits (no warn, no close) when
+      ``os.getpid() != self._creator_pid`` -- the parent still owns the
+      wrapped ``obj`` / io_loop / asyncio_loop; the child must NOT
+      ``close()`` them.
+    """
+    sync = asynchronous.SyncWrapper(HelperA)
+    asyncio_loop = sync.asyncio_loop
+    creator_pid = sync._creator_pid
+    assert creator_pid > 0
+    assert not asyncio_loop.is_closed()
+
+    # Simulate ``os.getpid()`` returning a different pid, as it would in
+    # a forked child.  Do NOT actually fork -- the parent's ``sync``
+    # reference has to survive so we can assert on it after GC.
+    monkeypatch.setattr("salt.utils.asynchronous.os.getpid", lambda: creator_pid + 1)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        del sync
+        gc.collect()
+
+    # 1. No ResourceWarning: the wrapper is not "our" object in the child.
+    resource_warnings = [w for w in caught if issubclass(w.category, ResourceWarning)]
+    unclosed_syncwrapper = [
+        w for w in resource_warnings if "unclosed SyncWrapper" in str(w.message)
+    ]
+    assert not unclosed_syncwrapper, (
+        "forked-child SyncWrapper.__del__ must NOT emit 'unclosed SyncWrapper' warning "
+        f"(fork-safety guard broken): {[str(w.message) for w in unclosed_syncwrapper]}"
+    )
+
+    # 2. Safety-net close() did NOT run in the "child": the underlying
+    #    asyncio_loop is still open (the parent still owns it).  Without
+    #    the guard, ``__del__`` would drive ``asyncio_loop.close()``.
+    assert not asyncio_loop.is_closed(), (
+        "forked-child SyncWrapper.__del__ must NOT close the shared asyncio_loop "
+        "(fork-safety guard broken -- parent's transport would be destroyed)"
+    )

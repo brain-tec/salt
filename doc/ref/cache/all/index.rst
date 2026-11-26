@@ -12,9 +12,9 @@ For understanding and usage of the cache modules see the :ref:`cache` topic.
     :toctree:
     :template: autosummary.rst.tmpl
 
+    _cluster_replicator
     consul
     etcd3_cache
-    etcd_cache
     localfs
     localfs_key
     mmap_cache

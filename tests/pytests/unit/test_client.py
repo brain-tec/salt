@@ -10,7 +10,7 @@ import tornado.ioloop
 import salt.client as client
 import salt.config
 from salt.exceptions import SaltClientError, SaltInvocationError, SaltReqTimeoutError
-from tests.support.mock import MagicMock, patch
+from tests.support.mock import AsyncMock, MagicMock, patch
 
 pytestmark = [
     pytest.mark.skip_on_windows,
@@ -20,7 +20,8 @@ pytestmark = [
 @pytest.fixture
 def master_opts(tmp_path):
     opts = salt.config.master_config(
-        os.path.join(os.path.dirname(client.__file__), "master")
+        os.path.join(os.path.dirname(client.__file__), "master"),
+        defaults=salt.config.DEFAULT_MASTER_OPTS.copy() | {"id": "client-test-master"},
     )
     opts["cachedir"] = str(tmp_path / "cache")
     opts["pki_dir"] = str(tmp_path / "pki")
@@ -166,61 +167,6 @@ def test_iter_failed_missing_returns_uses_grains_when_registry_empty(master_opts
                     "dummy": ["m3-dummy1", "m3-dummy2", "m3-dummy3"],
                 }
             }
-
-    mopts = dict(master_opts)
-    mopts["minion_data_cache"] = True
-
-    with patch("salt.utils.minions.CkMinions", return_value=_FakeCk()):
-        with patch("salt.cache.factory", return_value=_FakeCache()):
-            keys = [
-                next(iter(chunk))
-                for chunk in _iter_failed_missing_returns(mopts, set(), {"minion-3"})
-            ]
-    assert keys == ["minion-3", "m3-dummy1", "m3-dummy2", "m3-dummy3"]
-
-
-def test_iter_failed_missing_returns_uses_pillar_when_registry_and_grains_empty(
-    master_opts,
-):
-    from salt.client import _iter_failed_missing_returns
-
-    class _FakeReg:
-        def get_resources_for_minion(self, mid):
-            return {}
-
-    class _FakeCk:
-        registry = _FakeReg()
-
-    class _FakeCache:
-        def __init__(self):
-            self._grains = {}
-            self._pillar = {
-                "minion-3": {
-                    "resources": {
-                        "dummy": {
-                            "resource_ids": [
-                                "m3-dummy1",
-                                "m3-dummy2",
-                                "m3-dummy3",
-                            ],
-                        },
-                    },
-                }
-            }
-
-        def contains(self, bank, key):
-            if bank == "grains":
-                return key in self._grains
-            if bank == "pillar":
-                return key in self._pillar
-            return False
-
-        def fetch(self, bank, key):
-            if bank == "grains":
-                return self._grains.get(key, {})
-            if bank == "pillar":
-                return self._pillar.get(key, {})
-            return {}
 
     mopts = dict(master_opts)
     mopts["minion_data_cache"] = True
@@ -613,8 +559,8 @@ async def test_pub_async_default_timeout(master_opts):
                 "salt.channel.client.AsyncReqChannel.factory"
             ) as mock_channel_factory:
                 mock_channel = MagicMock()
-                mock_channel.__enter__ = MagicMock(return_value=mock_channel)
-                mock_channel.__exit__ = MagicMock(return_value=False)
+                mock_channel.__aenter__ = AsyncMock(return_value=mock_channel)
+                mock_channel.__aexit__ = AsyncMock(return_value=False)
 
                 # Mock the async send to return a coroutine that resolves to the payload
                 async def mock_send(*args, **kwargs):
@@ -653,8 +599,8 @@ async def test_pub_async_explicit_timeout(master_opts):
                 "salt.channel.client.AsyncReqChannel.factory"
             ) as mock_channel_factory:
                 mock_channel = MagicMock()
-                mock_channel.__enter__ = MagicMock(return_value=mock_channel)
-                mock_channel.__exit__ = MagicMock(return_value=False)
+                mock_channel.__aenter__ = AsyncMock(return_value=mock_channel)
+                mock_channel.__aexit__ = AsyncMock(return_value=False)
 
                 # Mock the async send to return a coroutine that resolves to the payload
                 async def mock_send(*args, **kwargs):
@@ -728,8 +674,8 @@ def test_pub_async_uses_publish_timeout_from_config(master_opts):
             raise tornado.gen.Return({"load": {"jid": "test_jid", "minions": ["m1"]}})
 
         mock_channel = MagicMock()
-        mock_channel.__enter__ = MagicMock(return_value=mock_channel)
-        mock_channel.__exit__ = MagicMock(return_value=False)
+        mock_channel.__aenter__ = AsyncMock(return_value=mock_channel)
+        mock_channel.__aexit__ = AsyncMock(return_value=False)
         mock_channel.send = mock_send
 
         with patch("os.path.exists", return_value=True), patch(

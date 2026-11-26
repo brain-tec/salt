@@ -101,10 +101,20 @@ def _strip_headers(output, *args):
             "updated packages",
             "upgraded packages",
         )
+        # ``dnf check-update`` appends an ``Obsoleting Packages`` section that
+        # lists obsoleting/obsoleted pairs (the obsoleted entry is the
+        # currently-installed package). _yum_pkginfo's 3-token cycle would
+        # mis-parse those rows and report the obsoleted (installed) package as
+        # an available upgrade, so truncate the output at that header.
+        trailer_terminators_lc = ("obsoleting packages",)
     else:
         args_lc = [x.lower() for x in args]
+        trailer_terminators_lc = ()
     ret = ""
     for line in salt.utils.itertools.split(output, "\n"):
+        line_lc = line.lower().strip()
+        if line_lc in trailer_terminators_lc:
+            break
         if line.lower() not in args_lc:
             ret += line + "\n"
     return ret
@@ -1033,20 +1043,24 @@ def list_upgrades(refresh=True, **kwargs):
     .. versionadded:: 2014.7.0
         Support for the ``disableexcludes`` option
 
+    .. note::
+        To add extra arguments to the ``yum list upgrades`` command, pass them as key
+        word arguments. For arguments without assignments, pass ``True``
+
     CLI Example:
 
     .. code-block:: bash
 
-        salt '*' pkg.list_upgrades
+        salt '*' pkg.list_upgrades security=True exclude='kernel*'
     """
-    options = _get_options(**kwargs)
+    options = _get_options(get_extra_options=True, **kwargs)
 
     if salt.utils.data.is_true(refresh):
         refresh_db(check_update=False, **kwargs)
 
     cmd = ["--quiet"]
     cmd.extend(options)
-    cmd.extend(["list", "--upgrades" if _yum() in ("dnf", "dnf5") else "updates"])
+    cmd.extend(["check-update"] if _yum() in ("dnf", "dnf5") else ["list", "updates"])
     out = _call_yum(cmd, ignore_retcode=True)
     if out["retcode"] != 0 and "Error:" in out:
         return {}
@@ -2253,6 +2267,7 @@ def hold(
 
         - On RHEL 5: ``yum-versionlock``
         - On RHEL 6 & 7: ``yum-plugin-versionlock``
+        - On RHEL 8, 9 & 10: ``python3-dnf-plugin-versionlock``
         - On Fedora: ``python-dnf-plugins-extras-versionlock``
 
 
@@ -2339,6 +2354,7 @@ def unhold(name=None, pkgs=None, sources=None, **kwargs):  # pylint: disable=W06
 
         - On RHEL 5: ``yum-versionlock``
         - On RHEL 6 & 7: ``yum-plugin-versionlock``
+        - On RHEL 8, 9 & 10: ``python3-dnf-plugin-versionlock``
         - On Fedora: ``python-dnf-plugins-extras-versionlock``
 
 
@@ -2446,6 +2462,7 @@ def list_holds(pattern=__HOLD_PATTERN, full=True):
 
         - On RHEL 5: ``yum-versionlock``
         - On RHEL 6 & 7: ``yum-plugin-versionlock``
+        - On RHEL 8, 9 & 10: ``python3-dnf-plugin-versionlock``
         - On Fedora: ``python-dnf-plugins-extras-versionlock``
 
     pattern : \w+(?:[.-][^-]+)*
@@ -2623,6 +2640,37 @@ def group_list():
         "available language groups:": "available languages",
     }
 
+    if _yum() == "dnf5":
+        # dnf5 lists environment groups and language groups under separate
+        # subcommands ("dnf5 environment list"), not under "group list", so the
+        # "installed/available environments" and "available languages" keys
+        # stay empty on dnf5 (the dnf/yum path below still fills them).
+        out = __salt__["cmd.run_stdout"](
+            [_yum(), "group", "list", "--hidden"],
+            output_loglevel="trace",
+            python_shell=False,
+        )
+        for line in salt.utils.itertools.split(out, "\n"):
+            # dnf5 'group list' is a whitespace-aligned table:
+            #   ID   Name (may contain spaces)   Installed (yes|no)
+            # Tokenize the row rather than matching the name with a regex, so a
+            # group name that happens to contain the word "yes" or "no" cannot
+            # be mistaken for the trailing Installed column. The header row and
+            # any blank/administrative lines have no yes/no last column and are
+            # skipped here.
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            installed = parts[-1].lower()
+            if installed not in ("yes", "no"):
+                continue
+            group_id = parts[0]
+            if installed == "yes":
+                ret["installed"].append(group_id)
+            else:
+                ret["available"].append(group_id)
+        return ret
+
     out = __salt__["cmd.run_stdout"](
         [_yum(), "grouplist", "hidden"], output_loglevel="trace", python_shell=False
     )
@@ -2726,7 +2774,10 @@ def group_info(name, expand=False, ignore_groups=None, **kwargs):
         }
     )
 
-    cmd = [_yum(), "--quiet"] + options + ["groupinfo", name]
+    if _yum() == "dnf5":
+        cmd = [_yum(), "--quiet"] + options + ["group", "info", name]
+    else:
+        cmd = [_yum(), "--quiet"] + options + ["groupinfo", name]
     out = __salt__["cmd.run_stdout"](cmd, output_loglevel="trace", python_shell=False)
 
     g_info = {}
@@ -2741,9 +2792,17 @@ def group_info(name, expand=False, ignore_groups=None, **kwargs):
         ret["type"] = "environment group"
     elif "group" in g_info:
         ret["type"] = "package group"
+    elif "name" in g_info:
+        # dnf5 'group info' labels a package group with "Name"/"Id" rather than
+        # the "Group"/"Group-Id" that dnf uses.
+        ret["type"] = "package group"
 
-    ret["group"] = g_info.get("environment group") or g_info.get("group")
-    ret["id"] = g_info.get("environment-id") or g_info.get("group-id")
+    ret["group"] = (
+        g_info.get("environment group") or g_info.get("group") or g_info.get("name")
+    )
+    ret["id"] = (
+        g_info.get("environment-id") or g_info.get("group-id") or g_info.get("id")
+    )
     if not ret["group"] and not ret["id"]:
         raise CommandExecutionError(f"Group '{name}' not found")
 
@@ -2754,7 +2813,14 @@ def group_info(name, expand=False, ignore_groups=None, **kwargs):
     for pkgtype in pkgtypes:
         target_found = False
         for line in salt.utils.itertools.split(out, "\n"):
-            line = line.strip().lstrip(string.punctuation)
+            line = line.strip().lstrip(string.punctuation).strip()
+            # ``member`` is the group member (a package or, for environment
+            # groups, a subgroup) this line contributes. For an ordinary member
+            # line it is the line itself; a dnf5 section header (below) carries
+            # its section's first member inline and overrides it.
+            member = line
+            # dnf (yum): the section header sits on its own line, e.g.
+            # "Mandatory Packages:", with members on the lines that follow.
             match = re.match(
                 pkgtypes_capturegroup + r" (?:groups|packages):\s*$", line.lower()
             )
@@ -2767,16 +2833,38 @@ def group_info(name, expand=False, ignore_groups=None, **kwargs):
                         # We've reached the targeted section
                         target_found = True
                     continue
+            # dnf5: the section header carries this section's first member
+            # inline, e.g. "Mandatory packages   : gettext".
+            match_dnf5 = re.match(
+                pkgtypes_capturegroup + r" (?:groups|packages)\s*:\s*(.*?)$",
+                line.lower(),
+            )
+            if match_dnf5:
+                if target_found:
+                    # We've reached a new section, break from loop
+                    break
+                if match_dnf5.group(1) != pkgtype:
+                    continue
+                # We've reached the targeted section
+                target_found = True
+                # Pull the inline first member into its own variable (keeping
+                # the original case) rather than overwriting ``line``: a header
+                # with trailing spaces or localized text could otherwise leave
+                # an empty string and silently drop the member.
+                first_member = re.match(r"^[^:]+:\s*(.+)$", line)
+                if first_member is None:
+                    continue
+                member = first_member.group(1).strip()
             if target_found:
                 if expand and ret["type"] == "environment group":
-                    if not line or line in completed_groups:
+                    if not member or member in completed_groups:
                         continue
                     log.trace(
                         'Adding group "%s" to completed list: %s',
-                        line,
+                        member,
                         completed_groups,
                     )
-                    completed_groups.append(line)
+                    completed_groups.append(member)
                     # The @ prefix disambiguates single-token group ids (e.g.
                     # gnome-desktop) that would otherwise match multiple
                     # groups, but dnf cannot resolve "@" + a multi-word group
@@ -2786,17 +2874,20 @@ def group_info(name, expand=False, ignore_groups=None, **kwargs):
                     # name so multi-word member groups still expand (#60276).
                     try:
                         expanded = group_info(
-                            "@" + line, expand=True, ignore_groups=completed_groups
+                            "@" + member, expand=True, ignore_groups=completed_groups
                         )
                     except CommandExecutionError:
                         expanded = group_info(
-                            line, expand=True, ignore_groups=completed_groups
+                            member, expand=True, ignore_groups=completed_groups
                         )
                     # Don't shadow the pkgtype variable from the outer loop
                     for p_type in pkgtypes:
                         ret[p_type].update(set(expanded[p_type]))
-                else:
-                    ret[pkgtype].add(line)
+                elif member:
+                    # Skip blank lines that fall inside the section (e.g. a
+                    # trailing/blank line before the next header) rather than
+                    # recording an empty package name.
+                    ret[pkgtype].add(member)
 
     for pkgtype in pkgtypes:
         ret[pkgtype] = sorted(ret[pkgtype])

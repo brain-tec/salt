@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import copy
+import inspect
 import logging
 import os
 import pathlib
@@ -15,22 +16,44 @@ import tornado.gen
 import tornado.ioloop
 import tornado.testing
 
+import salt.defaults.exitcodes
+import salt.loader.context
 import salt.minion
+import salt.modules.sysmod
 import salt.modules.test as test_mod
+import salt.payload
 import salt.syspaths
 import salt.utils.crypt
+import salt.utils.doc
+import salt.utils.event as event
+import salt.utils.files
 import salt.utils.jid
+import salt.utils.json
+import salt.utils.path
 import salt.utils.platform
 import salt.utils.process
 import salt.utils.state
+import salt.utils.stringutils
 from salt._compat import ipaddress
 from salt.exceptions import (
+    AuthenticationError,
     SaltClientError,
     SaltMasterUnresolvableError,
     SaltReqTimeoutError,
     SaltSystemExit,
 )
-from tests.support.mock import MagicMock, patch
+from tests.pytests.unit.utils.test_args import (
+    _all,
+    _default,
+    _kwargs,
+    _kwonly_no_pos,
+    _kwonly_req,
+    _nodefault,
+    _noparams,
+    _posonly,
+    _posonly_default_no_regular,
+)
+from tests.support.mock import AsyncMock, MagicMock, patch
 
 log = logging.getLogger(__name__)
 
@@ -98,6 +121,102 @@ def test_minion_load_grains_default(minion_opts):
             grainsfunc.assert_called()
         finally:
             minion.destroy()
+
+
+def test_sync_grains_masterless_syncs_every_file_roots_env(minion_opts):
+    """
+    A masterless minion syncs ``_grains`` from its local file_roots, ``base``
+    first, without removing modules that are not in the file roots.
+    """
+    minion_opts["file_client"] = "local"
+    minion_opts["file_roots"] = {"prod": ["/prod"], "base": ["/base"], "dev": ["/dev"]}
+    with patch("salt.utils.extmods.sync") as sync:
+        salt.minion._sync_grains(minion_opts)
+    sync.assert_called_once()
+    assert sync.call_args.args[1] == "grains"
+    assert sync.call_args.kwargs == {
+        "saltenv": ["base", "dev", "prod"],
+        "clean": False,
+    }
+
+
+def test_sync_grains_uses_a_throwaway_cachedir(minion_opts):
+    """
+    The sync must not leave fileserver state (file lists, cached files) in the
+    real ``cachedir``: it runs against a temporary one, which is removed
+    afterwards, and does not modify the opts it was given.
+    """
+    minion_opts["file_client"] = "local"
+    real_cachedir = minion_opts["cachedir"]
+    expected = copy.deepcopy(minion_opts)
+    seen = {}
+
+    def fake_sync(opts, form, **kwargs):
+        seen["cachedir"] = opts["cachedir"]
+        seen["existed"] = os.path.isdir(opts["cachedir"])
+        seen["others"] = {k: v for k, v in opts.items() if k != "cachedir"}
+
+    with patch("salt.utils.extmods.sync", fake_sync):
+        salt.minion._sync_grains(minion_opts)
+
+    assert seen["cachedir"] != real_cachedir
+    assert seen["existed"] is True
+    assert not os.path.exists(seen["cachedir"])
+    assert seen["others"] == {k: v for k, v in expected.items() if k != "cachedir"}
+    assert minion_opts == expected
+
+
+def test_sync_grains_masterless_defaults_to_base_env(minion_opts):
+    minion_opts["file_client"] = "local"
+    minion_opts.pop("file_roots", None)
+    with patch("salt.utils.extmods.sync") as sync:
+        salt.minion._sync_grains(minion_opts)
+    assert sync.call_args.kwargs["saltenv"] == ["base"]
+
+
+def test_sync_grains_remote_file_client_does_not_sync(minion_opts):
+    """
+    A minion that gets its files from a master must not sync here; the
+    master serves the files and ``saltutil.sync_grains`` handles it.
+    """
+    minion_opts["file_client"] = "remote"
+    with patch("salt.utils.extmods.sync") as sync:
+        salt.minion._sync_grains(minion_opts)
+    sync.assert_not_called()
+
+
+def test_sync_grains_failure_does_not_prevent_startup(minion_opts, caplog):
+    minion_opts["file_client"] = "local"
+    with caplog.at_level(logging.ERROR):
+        with patch("salt.utils.extmods.sync", side_effect=OSError("boom")):
+            salt.minion._sync_grains(minion_opts)
+    assert "Failed to sync custom grains" in caplog.text
+    assert "boom" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "file_client,expect_sync", [("local", True), ("remote", False)]
+)
+def test_sminion_syncs_grains_before_loading_them(
+    minion_opts, file_client, expect_sync
+):
+    """
+    ``SMinion`` (salt-call) syncs ``_grains`` before it loads grains, because
+    pillar is compiled from those grains.
+    """
+    minion_opts["file_client"] = file_client
+    calls = MagicMock()
+    with patch("salt.utils.extmods.sync", calls.sync), patch(
+        "salt.loader.grains", calls.grains
+    ), patch.object(salt.minion.SMinion, "gen_modules"), patch.object(
+        salt.minion.SMinion, "eval_master", AsyncMock(return_value=(None, MagicMock()))
+    ):
+        salt.minion.SMinion(minion_opts)
+    called = [c[0] for c in calls.mock_calls]
+    if expect_sync:
+        assert called[:2] == ["sync", "grains"]
+    else:
+        assert "sync" not in called
 
 
 @pytest.mark.parametrize(
@@ -175,6 +294,7 @@ def test_send_req_fires_completion_event(event, minion_opts):
                 minion.destroy()
 
 
+@pytest.mark.no_blocking(reason="Minion.start_engines() blocks briefly during setup")
 async def test_send_req_async_regression_62453(minion_opts):
 
     class MockEvent:
@@ -214,24 +334,533 @@ async def test_send_req_async_regression_62453(minion_opts):
                 rtn = await minion._send_req_async(load, timeout)
 
 
-def test_mine_send_tries(minion_opts):
+async def test_mine_send_tries(minion_opts):
     channel_enter = MagicMock()
-    channel_enter.send.side_effect = lambda load, timeout, tries: tries
+    channel_enter.send = AsyncMock(side_effect=lambda load, timeout, tries: tries)
     channel = MagicMock()
-    channel.__enter__.return_value = channel_enter
+    channel.__aenter__.return_value = channel_enter
 
     minion_opts["return_retry_tries"] = 20
-    with patch("salt.channel.client.ReqChannel.factory", return_value=channel), patch(
+    with patch(
+        "salt.channel.client.AsyncReqChannel.factory", return_value=channel
+    ) as factory, patch("salt.loader.grains"), patch("salt.engines.start_engines"):
+        minion = salt.minion.Minion(minion_opts)
+        try:
+            minion.tok = "token"
+
+            data = {}
+            tag = "tag"
+
+            rtn = await minion._mine_send(tag, data)
+            assert rtn == 20
+            # The channel runs on the minion's own loop, not on a private
+            # one that blocks it while the send is in flight.
+            assert factory.call_args.kwargs["io_loop"] is minion.io_loop
+            channel_enter.send.assert_awaited_once()
+        finally:
+            minion.destroy()
+
+
+async def test_minion_mine_event_does_not_block_io_loop(minion_opts):
+    """
+    While a master is unreachable a mine send can take minutes (timeout *
+    tries).  It must not block the event loop, which the minion shares with
+    every master it is connected to.
+    """
+    turns = 50
+
+    async def async_send(load, timeout, tries):
+        # Stands in for a long send: it gives up the loop a fixed number of
+        # times before it returns.
+        for _ in range(turns):
+            await asyncio.sleep(0)
+
+    async_channel = MagicMock()
+    async_channel.__aenter__.return_value = async_channel
+    async_channel.send = AsyncMock(side_effect=async_send)
+    # The blocking send this replaced went through ReqChannel.
+    sync_channel = MagicMock()
+    sync_channel.__enter__.return_value = sync_channel
+
+    ticks = 0
+
+    async def heartbeat():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0)
+            ticks += 1
+
+    with patch(
+        "salt.channel.client.AsyncReqChannel.factory", return_value=async_channel
+    ), patch(
+        "salt.channel.client.ReqChannel.factory", return_value=sync_channel
+    ), patch(
         "salt.loader.grains"
+    ), patch(
+        "salt.engines.start_engines"
     ):
         minion = salt.minion.Minion(minion_opts)
-        minion.tok = "token"
+        try:
+            minion.ready = True
+            minion.tok = "token"
+            package = salt.utils.event.SaltEvent.pack(
+                "_minion_mine", {"cmd": "_mine", "data": {}, "id": minion_opts["id"]}
+            )
+            task = asyncio.create_task(heartbeat())
+            try:
+                await minion.handle_event(package)
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        finally:
+            minion.destroy()
 
-        data = {}
-        tag = "tag"
+    # The heartbeat ticks each time the send gives up the loop, and never if
+    # the send blocks it.
+    assert ticks >= turns // 2
+    async_channel.send.assert_awaited_once()
 
-        rtn = minion._mine_send(tag, data)
-        assert rtn == 20
+
+class _FakeMineChannels:
+    """
+    Stand-in for ``AsyncReqChannel.factory`` in the mine send tests.  Every
+    send is logged as ``("start", load)`` and ``("end", load)``, and the
+    master URI of its channel is added to ``masters`` when it starts.  Sends
+    for a minion ID or master URI passed to ``hold()`` wait until
+    ``release()`` is called for it, and the next send to end raises the
+    first exception in ``errors``.
+    """
+
+    def __init__(self):
+        self.log = []
+        self.masters = []
+        self.errors = []
+        self._held = {}
+
+    def hold(self, minion_id):
+        self._held[minion_id] = asyncio.Event()
+
+    def release(self, minion_id):
+        self._held.pop(minion_id).set()
+
+    def started(self):
+        return [load for what, load in self.log if what == "start"]
+
+    def factory(self, opts, io_loop=None):
+        master = opts["master_uri"]
+
+        async def send(load, timeout, tries):
+            return await self._send(master, load)
+
+        channel = MagicMock()
+        channel.__aenter__.return_value = channel
+        channel.send = AsyncMock(side_effect=send)
+        return channel
+
+    async def _send(self, master, load):
+        self.log.append(("start", load))
+        self.masters.append(master)
+        held = self._held.get(load["id"]) or self._held.get(master)
+        if held is not None:
+            await held.wait()
+        self.log.append(("end", load))
+        if self.errors:
+            raise self.errors.pop(0)
+        return True
+
+
+@contextlib.contextmanager
+def _mine_test_minion(minion_opts, channels, minion_id):
+    minion_opts["id"] = minion_id
+    # Starting the engines is not needed here and can take long enough to
+    # trip the slow callback check.
+    with patch(
+        "salt.channel.client.AsyncReqChannel.factory", side_effect=channels.factory
+    ), patch("salt.loader.grains"), patch("salt.engines.start_engines"):
+        minion = salt.minion.Minion(minion_opts)
+        try:
+            minion.ready = True
+            minion.tok = "token"
+            yield minion
+        finally:
+            minion.destroy()
+
+
+def _mine_event(minion_id, cmd="_mine", **load):
+    return salt.utils.event.SaltEvent.pack(
+        "_minion_mine", dict(load, cmd=cmd, id=minion_id)
+    )
+
+
+async def _run_ready_tasks():
+    """
+    Give the tasks a test started the chance to run as far as they can
+    without the test releasing anything.  No time passes.
+    """
+    for _ in range(20):
+        await asyncio.sleep(0)
+
+
+async def test_mine_sends_for_one_minion_id_are_ordered(minion_opts):
+    """
+    A mine send must not start until the earlier one for the same minion ID
+    has finished.  Otherwise a slow update can reach the master after a
+    newer delete and bring the deleted data back.
+    """
+    channels = _FakeMineChannels()
+    minion_id = "minion1"
+    with _mine_test_minion(minion_opts, channels, minion_id) as minion:
+        channels.hold(minion_id)
+        update = asyncio.create_task(
+            minion.handle_event(_mine_event(minion_id, "_mine", data={"f": 1}))
+        )
+        await _run_ready_tasks()
+        delete = asyncio.create_task(
+            minion.handle_event(_mine_event(minion_id, "_mine_delete", fun="f"))
+        )
+        await _run_ready_tasks()
+        assert [load["cmd"] for load in channels.started()] == ["_mine"]
+        channels.release(minion_id)
+        await asyncio.gather(update, delete)
+
+    assert [(what, load["cmd"]) for what, load in channels.log] == [
+        ("start", "_mine"),
+        ("end", "_mine"),
+        ("start", "_mine_delete"),
+        ("end", "_mine_delete"),
+    ]
+
+
+async def test_mine_send_queued_after_earlier_one_finished_keeps_order(minion_opts):
+    """
+    A send that comes in after the first send finished, while a later one is
+    still in flight, has to wait for that later one too.
+    """
+    channels = _FakeMineChannels()
+    minion_id = "minion1"
+    with _mine_test_minion(minion_opts, channels, minion_id) as minion:
+        channels.hold(minion_id)
+        first = asyncio.create_task(
+            minion.handle_event(_mine_event(minion_id, data={"n": 0}))
+        )
+        await _run_ready_tasks()
+        second = asyncio.create_task(
+            minion.handle_event(_mine_event(minion_id, data={"n": 1}))
+        )
+        await _run_ready_tasks()
+        # Let the first one finish but keep the second one in flight.
+        channels.release(minion_id)
+        channels.hold(minion_id)
+        await _run_ready_tasks()
+        assert first.done()
+        assert [load["data"]["n"] for load in channels.started()] == [0, 1]
+        third = asyncio.create_task(
+            minion.handle_event(_mine_event(minion_id, data={"n": 2}))
+        )
+        await _run_ready_tasks()
+        assert [load["data"]["n"] for load in channels.started()] == [0, 1]
+        channels.release(minion_id)
+        await asyncio.gather(first, second, third)
+
+    assert [(what, load["data"]["n"]) for what, load in channels.log] == [
+        ("start", 0),
+        ("end", 0),
+        ("start", 1),
+        ("end", 1),
+        ("start", 2),
+        ("end", 2),
+    ]
+
+
+async def test_mine_sends_after_failover_do_not_wait_on_old_master(minion_opts):
+    """
+    On failover the minion points its opts at the new master in place.  A
+    send that hangs on the old master (it can take minutes or longer to
+    give up) must not hold up sends to the new master, and sends still
+    queued for the old master must go there, not to the new master after
+    newer data.
+    """
+    channels = _FakeMineChannels()
+    minion_id = "minion1"
+    with _mine_test_minion(minion_opts, channels, minion_id) as minion:
+        old_master = minion.opts["master_uri"]
+        new_master = "tcp://127.0.0.2:4506"
+        channels.hold(old_master)
+        queued = []
+        for n in range(2):
+            queued.append(
+                asyncio.create_task(
+                    minion.handle_event(_mine_event(minion_id, data={"n": n}))
+                )
+            )
+            await _run_ready_tasks()
+        # What eval_master does to self.opts on failover.
+        minion.opts["master"] = "127.0.0.2"
+        minion.opts["master_uri"] = new_master
+        after = asyncio.create_task(
+            minion.handle_event(_mine_event(minion_id, data={"n": 2}))
+        )
+        await _run_ready_tasks()
+        assert after.done()
+        channels.release(old_master)
+        await asyncio.gather(*queued, after)
+
+    sent = [load["data"]["n"] for load in channels.started()]
+    assert list(zip(sent, channels.masters)) == [
+        (0, old_master),
+        (2, new_master),
+        (1, old_master),
+    ]
+
+
+async def test_mine_sends_pending_for_one_minion_id_are_capped(minion_opts, caplog):
+    """
+    While the master is unreachable each mine send can take minutes.  Only a
+    few may be pending for one minion ID; newer mine updates are dropped
+    with a warning rather than queued or sent out of order.
+    """
+    cap = salt.minion._MINE_SEND_MAX_PENDING
+    channels = _FakeMineChannels()
+    minion_id = "minion1"
+    with _mine_test_minion(minion_opts, channels, minion_id) as minion:
+        channels.hold(minion_id)
+        with caplog.at_level(logging.WARNING):
+            tasks = [
+                asyncio.create_task(
+                    minion.handle_event(_mine_event(minion_id, data={"n": n}))
+                )
+                for n in range(cap + 2)
+            ]
+            await _run_ready_tasks()
+        assert len(channels.started()) == 1
+        dropped = [
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("Not sending mine data")
+        ]
+        assert len(dropped) == 2
+        assert all(minion_id in message for message in dropped)
+        assert all(task.done() for task in tasks[cap:])
+        channels.release(minion_id)
+        await asyncio.gather(*tasks)
+
+    assert [load["data"]["n"] for load in channels.started()] == list(range(cap))
+
+
+async def test_mine_delete_and_flush_are_queued_past_the_cap(minion_opts, caplog):
+    """
+    Nothing sends a mine.delete or mine.flush again, so if one were dropped
+    the master would keep the data it removes.  Past the cap they are still
+    queued, in order, while new mine updates are dropped.
+    """
+    cap = salt.minion._MINE_SEND_MAX_PENDING
+    channels = _FakeMineChannels()
+    minion_id = "minion1"
+    with _mine_test_minion(minion_opts, channels, minion_id) as minion:
+        channels.hold(minion_id)
+        packages = [_mine_event(minion_id, data={"n": n}) for n in range(cap)]
+        packages += [
+            _mine_event(minion_id, "_mine_delete", fun="f"),
+            _mine_event(minion_id, data={"n": cap}),
+            _mine_event(minion_id, "_mine_flush"),
+        ]
+        with caplog.at_level(logging.WARNING):
+            tasks = [
+                asyncio.create_task(minion.handle_event(package))
+                for package in packages
+            ]
+            await _run_ready_tasks()
+        dropped = [
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("Not sending mine data")
+        ]
+        assert len(dropped) == 1
+        assert tasks[cap + 1].done()
+        channels.release(minion_id)
+        await asyncio.gather(*tasks)
+
+    assert [load["cmd"] for load in channels.started()] == ["_mine"] * cap + [
+        "_mine_delete",
+        "_mine_flush",
+    ]
+    assert [load["data"]["n"] for load in channels.started()[:cap]] == list(range(cap))
+
+
+async def test_mine_sends_for_sub_proxy_ids_are_ordered(minion_opts):
+    """
+    The channel sends every load under the minion's own ID, so the master
+    keeps the mine data of a deltaproxy's sub-proxies in the control proxy's
+    record.  Sends with a sub-proxy ID in the load must still go out one at
+    a time, or two of them in flight at once can undo each other there.
+    """
+    channels = _FakeMineChannels()
+    minion_id = "control-proxy"
+    with _mine_test_minion(minion_opts, channels, minion_id) as minion:
+        channels.hold("sub1")
+        first = asyncio.create_task(
+            minion.handle_event(_mine_event("sub1", data={"a": 1}))
+        )
+        await _run_ready_tasks()
+        second = asyncio.create_task(
+            minion.handle_event(_mine_event("sub2", data={"b": 1}))
+        )
+        await _run_ready_tasks()
+        assert [load["id"] for load in channels.started()] == ["sub1"]
+        channels.release("sub1")
+        await asyncio.gather(first, second)
+
+    assert [(what, load["id"]) for what, load in channels.log] == [
+        ("start", "sub1"),
+        ("end", "sub1"),
+        ("start", "sub2"),
+        ("end", "sub2"),
+    ]
+
+
+async def test_mine_sends_for_sub_proxy_ids_are_capped_per_id(minion_opts, caplog):
+    """
+    A mine.update run on a deltaproxy's sub-proxies sends one update for
+    each of them at about the same time.  They go out one at a time, but
+    the cap counts each sub-proxy ID on its own, so none of them is dropped
+    while the first one is still in flight.  Past the cap for one
+    sub-proxy, the warning names that sub-proxy, and an update for another
+    sub-proxy is still queued.
+    """
+    cap = salt.minion._MINE_SEND_MAX_PENDING
+    channels = _FakeMineChannels()
+    sub_ids = [f"sub{n}" for n in range(cap + 2)]
+    late_id = f"sub{len(sub_ids)}"
+    with _mine_test_minion(minion_opts, channels, "control-proxy") as minion:
+        channels.hold("sub0")
+        packages = [_mine_event(sub_id) for sub_id in sub_ids]
+        packages += [_mine_event("sub0", data={"n": n}) for n in range(cap)]
+        packages.append(_mine_event(late_id))
+        with caplog.at_level(logging.WARNING):
+            tasks = [
+                asyncio.create_task(minion.handle_event(package))
+                for package in packages
+            ]
+            await _run_ready_tasks()
+        assert [load["id"] for load in channels.started()] == ["sub0"]
+        dropped = [
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("Not sending mine data")
+        ]
+        assert len(dropped) == 1
+        assert dropped[0].startswith("Not sending mine data for sub0 ")
+        assert tasks[-2].done()
+        assert not tasks[-1].done()
+        channels.release("sub0")
+        await asyncio.gather(*tasks)
+
+    started = channels.started()
+    expected = sub_ids + ["sub0"] * (cap - 1) + [late_id]
+    assert [load["id"] for load in started] == expected
+    later = [load["data"]["n"] for load in started[len(sub_ids) : -1]]
+    assert later == list(range(cap - 1))
+
+
+async def test_mine_send_state_is_cleared(minion_opts):
+    """
+    The lock and counts for a master go away once nothing is pending for
+    it, also after a send raised or a waiting send was cancelled.
+    """
+    channels = _FakeMineChannels()
+    minion_id = "minion1"
+    with _mine_test_minion(minion_opts, channels, minion_id) as minion:
+        key = (minion.opts["master_uri"], minion_id)
+        channels.errors.append(AuthenticationError("master cluster is not ready"))
+        with pytest.raises(AuthenticationError):
+            await minion.handle_event(_mine_event(minion_id))
+        assert minion._mine_send_locks == {}
+        assert minion._mine_send_pending == {}
+
+        channels.hold(minion_id)
+        channels.errors.append(AuthenticationError("master cluster is not ready"))
+        tasks = [
+            asyncio.create_task(minion.handle_event(_mine_event(minion_id, cmd)))
+            for cmd in ("_mine", "_mine_delete", "_mine_flush")
+        ]
+        await _run_ready_tasks()
+        assert minion._mine_send_pending == {key: {minion_id: 3}}
+        tasks[1].cancel()
+        await _run_ready_tasks()
+        assert minion._mine_send_pending == {key: {minion_id: 2}}
+        channels.release(minion_id)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        assert isinstance(results[0], AuthenticationError)
+        assert isinstance(results[1], asyncio.CancelledError)
+        assert results[2] is None
+        assert [load["cmd"] for load in channels.started()] == [
+            "_mine",
+            "_mine",
+            "_mine_flush",
+        ]
+        assert minion._mine_send_locks == {}
+        assert minion._mine_send_pending == {}
+
+
+_SIGN_IN_TIMEOUT = (
+    "Attempt to authenticate with the salt master failed with timeout error"
+)
+
+
+@pytest.mark.parametrize(
+    "error,message,warning",
+    [
+        (
+            SaltReqTimeoutError,
+            "Message timed out",
+            "Unable to send mine data to master.",
+        ),
+        (
+            SaltClientError,
+            _SIGN_IN_TIMEOUT,
+            f"Unable to send mine data to master: {_SIGN_IN_TIMEOUT}",
+        ),
+    ],
+    ids=["request-timeout", "sign-in-failure"],
+)
+async def test_mine_send_that_gives_up_is_not_left_pending(
+    minion_opts, caplog, error, message, warning
+):
+    """
+    A send that gives up on an unreachable master, because the request or
+    signing in again failed, logs a warning and returns None.  It must not
+    raise out of handle_event, which MinionManager logs as an error, and
+    must not stay pending, or once the cap is reached every later send
+    would be dropped.
+    """
+    cap = salt.minion._MINE_SEND_MAX_PENDING
+    channels = _FakeMineChannels()
+    minion_id = "minion1"
+    with _mine_test_minion(minion_opts, channels, minion_id) as minion:
+        with caplog.at_level(logging.WARNING):
+            channels.errors.append(error(message))
+            load = {"cmd": "_mine", "id": minion_id}
+            assert await minion._mine_send("_minion_mine", load) is None
+            assert minion._mine_send_locks == {}
+            assert minion._mine_send_pending == {}
+            for n in range(cap):
+                channels.errors.append(error(message))
+                await minion.handle_event(_mine_event(minion_id, data={"n": n}))
+            await minion.handle_event(_mine_event(minion_id, data={"n": cap}))
+
+    unable = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("Unable to send mine data")
+    ]
+    assert [record.getMessage() for record in unable] == [warning] * (cap + 1)
+    assert {record.levelno for record in unable} == {logging.WARNING}
+    messages = [record.getMessage() for record in caplog.records]
+    assert not [m for m in messages if m.startswith("Not sending mine data")]
+    sent = [load["data"]["n"] for load in channels.started()[1:]]
+    assert sent == list(range(cap + 1))
 
 
 def test_invalid_master_address(minion_opts):
@@ -730,6 +1359,76 @@ async def test_scheduler_before_connect(minion_opts):
             assert "beacons" not in minion.periodic_callbacks
         finally:
             minion.destroy()
+
+
+@pytest.mark.slow_test
+async def test_scheduler_not_run_when_not_schedule_leader(minion_opts):
+    """
+    Tests that a minion that is not the schedule_leader, ie. a minion spawned
+    by a MinionManager in a multimaster configuration connected to every master
+    but the first one, does not have its scheduler initialized.
+    """
+    with patch("salt.minion.Minion.ctx", MagicMock(return_value={})), patch(
+        "salt.minion.Minion.sync_connect_master",
+        MagicMock(side_effect=RuntimeError("stop execution")),
+    ), patch(
+        "salt.utils.process.SignalHandlingProcess.start",
+        MagicMock(return_value=True),
+    ), patch(
+        "salt.utils.process.SignalHandlingProcess.join",
+        MagicMock(return_value=True),
+    ):
+        minion_opts["scheduler_before_connect"] = True
+        minion_opts["schedule_leader"] = False
+        io_loop = tornado.ioloop.IOLoop()
+        minion = salt.minion.Minion(minion_opts, io_loop=io_loop)
+        try:
+            try:
+                await minion.tune_in(start=True)
+            except RuntimeError:
+                pass
+
+            # Make sure the scheduler was not initialized
+            assert "schedule" not in minion.periodic_callbacks
+        finally:
+            minion.destroy()
+
+
+async def test_spawn_minions_schedule_leader(minion_opts):
+    """
+    Tests that, in a multimaster configuration, only the minion connected to
+    the first master is the schedule_leader.
+    """
+    minion_opts["master"] = ["10.0.0.1", "10.0.0.2"]
+
+    created_opts = []
+
+    def _create_minion_object(opts, *args, **kwargs):
+        created_opts.append(dict(opts))
+        minion = MagicMock(name="minion")
+        minion.opts = opts
+        return minion
+
+    async def _connect_minion(minion):
+        return None
+
+    mm = salt.minion.MinionManager(minion_opts)
+    try:
+        with patch.object(
+            mm, "_create_minion_object", _create_minion_object
+        ), patch.object(mm, "_connect_minion", _connect_minion):
+            mm._spawn_minions()
+            # Give the fake connect coroutines a chance to run
+            await asyncio.sleep(0)
+    finally:
+        mm.io_loop = MagicMock()
+        mm.destroy()
+
+    assert len(created_opts) == 2
+    assert created_opts[0]["beacons_leader"] is True
+    assert created_opts[0]["schedule_leader"] is True
+    assert created_opts[1]["beacons_leader"] is False
+    assert created_opts[1]["schedule_leader"] is False
 
 
 def test_minion_module_refresh(minion_opts):
@@ -1448,6 +2147,70 @@ def test_resolve_dns_retry_aborts_on_shutdown_request_69466(minion_opts):
     )
 
 
+def test_resolve_dns_count_zero_fails_fast(minion_opts):
+    """
+    ``retry_dns_count: 0`` must make resolve_dns raise immediately on an
+    unresolvable master instead of entering the ``retry_dns`` sleep loop.
+    This is what lets forked workers fail fast rather than leak.
+    """
+    minion_opts.update(
+        {
+            "ipv6": False,
+            "master": "dummy",
+            "master_port": "4555",
+            # A large interval so that if the retry loop is (wrongly) entered
+            # the test would visibly stall instead of passing by luck.
+            "retry_dns": 90,
+            "retry_dns_count": 0,
+        },
+    )
+
+    dns_check = MagicMock(side_effect=SaltClientError("unresolvable"))
+    started = time.monotonic()
+    with patch("salt.utils.network.dns_check", dns_check):
+        with pytest.raises(SaltMasterUnresolvableError):
+            salt.minion.resolve_dns(minion_opts)
+    elapsed = time.monotonic() - started
+
+    # With retry_dns_count == 0 the loop raises on its first iteration before
+    # any retry sleep, so the initial lookup is the only dns_check call and
+    # the call returns effectively immediately.
+    assert dns_check.call_count == 1
+    assert elapsed < 5, (
+        f"resolve_dns slept before failing with retry_dns_count=0 "
+        f"(elapsed={elapsed:.2f}s); it should fail fast."
+    )
+
+
+def test_target_bounds_worker_dns_retry(minion_opts):
+    """
+    A forked per-job worker must not inherit an unbounded DNS retry loop.
+    Minion._target should force ``retry_dns_count`` to 0 when the operator
+    has not set it, and leave an explicit value untouched.
+    """
+    data = {"jid": "20240101000000000000", "fun": "test.ping", "arg": []}
+
+    # Stub out the actual job execution so the test exercises only the
+    # ``opts`` mutation in ``_target``'s preamble, without requiring a fully
+    # initialized minion (functions/ctx). ``_target`` on this branch runs
+    # the real body under ``request_context`` directly (no tornado
+    # ``stack_context`` wrapper), so patching ``_thread_return`` is enough.
+    with patch.object(salt.minion.Minion, "_thread_return", MagicMock()):
+        # Operator did not set retry_dns_count -> worker fails fast.
+        unset_opts = copy.deepcopy(minion_opts)
+        unset_opts["retry_dns_count"] = None
+        minion = salt.minion.Minion(unset_opts, load_grains=False)
+        salt.minion.Minion._target(minion, unset_opts, data, True, None)
+        assert unset_opts["retry_dns_count"] == 0
+
+        # Operator set an explicit bound -> _target leaves it alone.
+        explicit_opts = copy.deepcopy(minion_opts)
+        explicit_opts["retry_dns_count"] = 5
+        minion = salt.minion.Minion(explicit_opts, load_grains=False)
+        salt.minion.Minion._target(minion, explicit_opts, data, True, None)
+        assert explicit_opts["retry_dns_count"] == 5
+
+
 def test_minion_manager_stop_unblocks_resolve_dns_69466(minion_opts):
     """
     Regression test for #69466.
@@ -1464,6 +2227,9 @@ def test_minion_manager_stop_unblocks_resolve_dns_69466(minion_opts):
 
     manager = salt.minion.MinionManager.__new__(salt.minion.MinionManager)
     manager.io_loop = MagicMock()
+    # A live (not-yet-closed) io_loop, so MinionManager.stop()'s #70178
+    # closed-loop guard doesn't short-circuit before scheduling stop_async.
+    manager.io_loop.is_closed.return_value = False
     # Populate the attributes __del__ -> destroy() touches so the
     # interpreter does not log an AttributeError at GC time.
     manager.minions = []
@@ -1509,6 +2275,889 @@ def test_gen_modules_executors(minion_opts):
         )
     finally:
         minion.destroy()
+
+
+@contextlib.contextmanager
+def _threaded_minion_61830(minion_opts, pillar=None):
+    """
+    A real Minion set up the way a threaded minion (multiprocessing: False)
+    runs jobs, with _return_pub replaced by a recorder. Yields
+    ``(minion, delivered)``.
+
+    These tests pre-date the pillar-to-opts refactor for resource
+    inventory (see commit ``resources: remove pillar as resource-inventory
+    source on the minion``).  Keep the pre-refactor fixture shape --
+    ``pillar = {"resources": {<rtype>: {"resource_ids": [...]}}}`` -- so
+    the test bodies stay unchanged, but wire it up to the opts-driven
+    API: derive ``resource_types`` from the pillar dict and stub
+    ``_iter_resource_ids`` to yield each type's declared IDs.  This is
+    the same shim pattern used in ``test_minion_resources.py``.
+    """
+    minion_opts["multiprocessing"] = False
+    minion_opts["file_client"] = "local"
+    minion_opts["grains"] = {}
+    minion_opts["pillar"] = pillar or {}
+    pillar_resources = (pillar or {}).get("resources") or {}
+    minion_opts["resource_types"] = list(pillar_resources.keys())
+    io_loop = tornado.ioloop.IOLoop()
+    minion = salt.minion.Minion(minion_opts, io_loop=io_loop)
+    try:
+        # Stream per-type IDs from the pillar dict so target
+        # resolution and the per-type loader build see the same
+        # inventory the pre-refactor tests set up.
+        def _fake_iter(rtype, _pillar=pillar_resources):
+            decl = _pillar.get(rtype) or {}
+            if isinstance(decl, dict):
+                ids = decl.get("resource_ids") or []
+            elif isinstance(decl, list):
+                ids = decl
+            else:
+                ids = []
+            return iter(ids)
+
+        minion._iter_resource_ids = _fake_iter
+        minion.gen_modules()
+        minion.connected = True
+        proc_dir = os.path.join(minion_opts["cachedir"], "proc")
+        os.makedirs(proc_dir, exist_ok=True)
+        minion.proc_dir = proc_dir
+        delivered = []
+        minion._return_pub = lambda ret, *args, **kwargs: delivered.append(ret)
+        yield minion, delivered
+    finally:
+        minion.destroy()
+
+
+def _racing_gen_modules_61830(minion, state, prepare=None):
+    """
+    Return a stand-in for ``minion.gen_modules`` that runs the job's own real
+    gen_modules() and then a sibling job's real gen_modules(), which rebinds
+    the shared minion.functions, minion.executors and minion.resource_loaders
+    before the job uses any of them. The job's own return value is passed
+    through untouched.
+
+    Both generations are recorded in ``state`` as ``<label>_functions``,
+    ``<label>_executors`` and ``<label>_resource_loaders`` (label ``job`` or
+    ``sibling``). ``prepare(label)`` runs right after each of the two real
+    calls, while the shared attributes still point at that generation, so a
+    test can install per-generation fakes.
+    """
+    real_gen_modules = minion.gen_modules
+
+    def record(label):
+        if prepare is not None:
+            prepare(label)
+        state[f"{label}_functions"] = minion.functions
+        state[f"{label}_executors"] = minion.executors
+        state[f"{label}_resource_loaders"] = minion.resource_loaders
+
+    def racing_gen_modules(*args, **kwargs):
+        own = real_gen_modules(*args, **kwargs)
+        record("job")
+        real_gen_modules()
+        record("sibling")
+        return own
+
+    return racing_gen_modules
+
+
+def _assert_distinct_generations_61830(state):
+    # The race really produced two loader generations that do not share a
+    # __context__; otherwise the test would prove nothing.
+    assert state["job_functions"] is not state["sibling_functions"]
+    assert state["job_executors"] is not state["sibling_executors"]
+    assert (
+        state["job_functions"].pack["__context__"]
+        is not state["sibling_functions"].pack["__context__"]
+    )
+
+
+def _sibling_job_61830(minion, functions, code, fun="test.retcode", exec_fn=None):
+    """
+    A sibling job's real _execute_job_function on ``functions``: the
+    start-of-job retcode reset, then ``fun`` writes ``code`` into that
+    loader's __context__.
+    """
+    if exec_fn is None:
+        exec_fn = salt.minion.Minion._execute_job_function
+    exec_fn(
+        minion,
+        fun,
+        [code],
+        ["direct_call"],
+        minion.opts,
+        {
+            "jid": f"20260101000001{code:06d}",
+            "fun": fun,
+            "arg": [code],
+            "ret": "",
+        },
+        functions=functions,
+    )
+
+
+def _run_job_thread_61830(target, minion, data):
+    """
+    Run a job runner (``Minion._thread_return``) on its own thread, the way a
+    threaded minion (multiprocessing: False) runs every job.
+
+    For a job with ``data["resource_target"]``, _thread_return sets
+    ``salt.loader.context.resource_ctxvar`` and never resets it: the job's
+    thread, and the context it set the value in, end with the job. Called on
+    the pytest main thread, that value would outlive the test and leak into
+    every later test that reads the variable.
+    """
+    errors = []
+
+    def run():
+        try:
+            target(minion, minion.opts, data)
+        except BaseException as exc:  # pylint: disable=broad-except
+            errors.append(exc)
+
+    thread = threading.Thread(target=run, name=str(data["jid"]))
+    thread.start()
+    thread.join(timeout=120)
+    assert not thread.is_alive(), "job thread did not finish"
+    if errors:
+        raise errors[0]
+
+
+@contextlib.contextmanager
+def _sudo_available_61830():
+    """
+    The sudo executor's __virtual__ needs sudo on the PATH as well as
+    sudo_user; report it present without touching any other lookup.
+    """
+    real_which = salt.utils.path.which
+
+    def which(exe):
+        if exe == "sudo":
+            return "/usr/bin/sudo"
+        return real_which(exe)
+
+    with patch("salt.utils.path.which", which):
+        yield
+
+
+def _sudo_stdout_61830(retcode):
+    # What ``salt-call --out json --metadata -- test.retcode <n>`` prints.
+    return salt.utils.json.dumps(
+        {"local": {"fun": "test.retcode", "return": True, "retcode": retcode}}
+    )
+
+
+# (this job's test.retcode argument, what cmd.run_all returns for the
+# ``sudo -u <user> salt-call ...`` command, expected delivered retcode,
+# expected delivered return)
+SUDO_CASES_61830 = pytest.mark.parametrize(
+    "code,cmd_ret,expected_retcode,expected_return",
+    [
+        # salt-call ran the job under sudo and the job failed; the sudo
+        # executor takes the retcode from salt-call's metadata.
+        (
+            42,
+            {"pid": 4242, "retcode": 0, "stdout": _sudo_stdout_61830(42), "stderr": ""},
+            42,
+            True,
+        ),
+        # sudo itself failed, salt-call never ran; the sudo executor takes
+        # sudo's exit code.
+        (
+            42,
+            {
+                "pid": 4242,
+                "retcode": 1,
+                "stdout": "",
+                "stderr": "sudo: a password is required",
+            },
+            1,
+            "sudo: a password is required",
+        ),
+        # Inverse must-not: a job that passed under sudo stays passing.
+        (
+            0,
+            {"pid": 4242, "retcode": 0, "stdout": _sudo_stdout_61830(0), "stderr": ""},
+            salt.defaults.exitcodes.EX_OK,
+            True,
+        ),
+    ],
+    ids=["job-failed-under-sudo", "sudo-failed", "passing-job-stays-passing"],
+)
+
+
+def _fake_sudo_salt_call_61830(minion, cmd_ret, calls):
+    """
+    ``prepare`` hook for _racing_gen_modules_61830: replace cmd.run_all on
+    each loader generation with a fake for the ``sudo -u <user> salt-call``
+    command the sudo executor runs through ``__salt__["cmd.run_all"]``.
+    """
+
+    def prepare(label):
+        def run_all(cmd, **kwargs):
+            calls.append(cmd)
+            return dict(cmd_ret)
+
+        minion.functions["cmd.run_all"] = run_all
+
+    return prepare
+
+
+def _assert_sudo_call_61830(calls, code):
+    # The job really ran through the sudo executor, exactly once, with this
+    # job's argument.
+    assert len(calls) == 1
+    assert calls[0][:3] == ["sudo", "-u", "saltdev"]
+    assert calls[0][-1] == str(code)
+
+
+def test_thread_return_retcode_owns_captured_loader_61830(minion_opts):
+    """
+    #61830: with multiprocessing=False every threaded job shares one
+    minion_instance, and every job calls minion_instance.gen_modules() at its
+    top. That builds a new loader generation with a fresh, empty __context__
+    and rebinds the shared minion_instance.functions to it.
+
+    On 3008.x the resource-loader work already makes _thread_return capture
+    ``functions_to_use = minion_instance.functions`` once and pass it to
+    _execute_job_function, so a sibling rebind between this job's retcode
+    write and its retcode read no longer changes which loader is read. The
+    remaining single-function gap is earlier: the window between the job's own
+    gen_modules() call and that capture. A sibling job's gen_modules() landing
+    there makes this job capture the SIBLING's loader, so both jobs share one
+    __context__ and the sibling's start-of-job retcode reset in
+    _execute_job_function (``__context__["retcode"] = 0``) overwrites the
+    retcode this job wrote: a failed command is reported as success, and a
+    failing sibling's retcode leaks into a passing job. The fix makes
+    _thread_return use the loaders its own gen_modules() call returned.
+
+    This drives the REAL Minion._thread_return end to end:
+
+    - the job's own gen_modules() call is wrapped so a real sibling
+      gen_modules() runs right after it, before _thread_return captures a
+      loader;
+    - the sibling job's real _execute_job_function (retcode reset, then
+      test.retcode on the sibling's own loader) runs in this job's write->read
+      window (the only thing _thread_return does there is
+      log.info("... execution finished")).
+
+    test.retcode writes the retcode into its loader's __context__ exactly like
+    a production module.
+    """
+    with _threaded_minion_61830(minion_opts) as (minion, delivered):
+        original_info = salt.minion.log.info
+        state = {}
+
+        def sibling_starts_info(msg, *args, **kwargs):
+            # The sibling job starts executing in this job's write->read
+            # window, on the loader its own gen_modules() built.
+            if "execution finished" in str(msg) and not state.get("sibling_ran"):
+                state["sibling_ran"] = True
+                _sibling_job_61830(
+                    minion, state["sibling_functions"], state["sibling_code"]
+                )
+            return original_info(msg, *args, **kwargs)
+
+        def run(code, sibling_code=0):
+            delivered.clear()
+            state.clear()
+            state["sibling_code"] = sibling_code
+            data = {
+                "jid": f"20260101000000{code:06d}",
+                "fun": "test.retcode",
+                "arg": [code],
+                "ret": "",
+            }
+            with patch.object(
+                minion, "gen_modules", _racing_gen_modules_61830(minion, state)
+            ), patch.object(salt.minion.log, "info", sibling_starts_info):
+                salt.minion.Minion._thread_return(minion, minion.opts, data)
+            assert state.get("sibling_ran"), "sibling job never ran in the window"
+            _assert_distinct_generations_61830(state)
+            assert len(delivered) == 1
+            return delivered[0]
+
+        # A FAILED job (retcode 42) whose sibling passes must be delivered as
+        # failed. Pre-fix this job ran on the sibling's loader and the sibling's
+        # reset turned it into retcode=0/success=True (the bug).
+        ret = run(42)
+        assert ret["retcode"] == 42
+        assert ret["success"] is False
+        # The retcode lives in, and was read from, the loader this job built;
+        # the sibling's loader only holds the sibling's own retcode.
+        assert state["job_functions"].pack["__context__"]["retcode"] == 42
+        assert (
+            state["sibling_functions"].pack["__context__"]["retcode"]
+            == salt.defaults.exitcodes.EX_OK
+        )
+
+        # Inverse must-not: a SUCCEEDING job (retcode 0) under the same forced
+        # interleave must still be delivered as success; the fix must not flip
+        # a genuinely-passing job to failed.
+        ret = run(0)
+        assert ret["retcode"] == salt.defaults.exitcodes.EX_OK
+        assert ret["success"] is True
+
+        # Inverse must-not: a FAILING sibling (retcode 7) must not leak its
+        # retcode into a passing job. Pre-fix this job was delivered as
+        # retcode=7/success=False.
+        ret = run(0, sibling_code=7)
+        assert ret["retcode"] == salt.defaults.exitcodes.EX_OK
+        assert ret["success"] is True
+
+
+@SUDO_CASES_61830
+def test_thread_return_sudo_executor_owns_job_generation_61830(
+    minion_opts, code, cmd_ret, expected_retcode, expected_return
+):
+    """
+    #61830 with ``sudo_user`` set: the sudo executor runs the job as
+    ``sudo -u <sudo_user> salt-call ...`` through ``__salt__["cmd.run_all"]``
+    and writes the retcode into the ``__context__`` of the loader generation
+    the EXECUTOR belongs to, not the one the function lookup used.
+    _thread_return reads the retcode back from the generation its own
+    gen_modules() call returned, so it must also run through that
+    generation's executors.
+
+    A sibling job's gen_modules() between this job's own gen_modules() and its
+    executor call rebinds minion.executors. A job that owned its functions
+    loader but still ran through the shared minion.executors (the first
+    version of this fix) had the sudo executor write the retcode into the
+    sibling's __context__ and read its own, freshly reset one: a failed job
+    was reported as success.
+
+    Stock 3008.x passes this by design: it captures minion.functions only
+    after the sibling's rebind and runs through minion.executors, so its
+    write and its read both land in the sibling's generation. This guards
+    against loader ownership breaking the sudo case.
+    """
+    minion_opts["sudo_user"] = "saltdev"
+    state = {}
+    calls = []
+    with _threaded_minion_61830(minion_opts) as (
+        minion,
+        delivered,
+    ), _sudo_available_61830():
+        data = {
+            "jid": f"20260101000000{code:06d}",
+            "fun": "test.retcode",
+            "arg": [code],
+            "ret": "",
+        }
+        racing = _racing_gen_modules_61830(
+            minion, state, _fake_sudo_salt_call_61830(minion, cmd_ret, calls)
+        )
+        with patch.object(minion, "gen_modules", racing):
+            salt.minion.Minion._thread_return(minion, minion.opts, data)
+
+    _assert_distinct_generations_61830(state)
+    _assert_sudo_call_61830(calls, code)
+    assert len(delivered) == 1
+    ret = delivered[0]
+    assert ret["return"] == expected_return
+    assert ret["retcode"] == expected_retcode
+    assert ret["success"] is (expected_retcode == salt.defaults.exitcodes.EX_OK)
+
+
+@SUDO_CASES_61830
+def test_thread_multi_return_sudo_executor_owns_job_generation_61830(
+    minion_opts, code, cmd_ret, expected_retcode, expected_return
+):
+    """
+    #61830, multi-function path, with ``sudo_user`` set: the sudo executor
+    writes the retcode into the ``__context__`` of the generation the
+    executor belongs to, and _thread_multi_return reads it back from the
+    generation its own gen_modules() call returned, so it must also run each
+    function through that generation's executors.
+
+    A sibling job's gen_modules() between this job's own gen_modules() and
+    the function call rebinds minion.executors. Passing only the job's
+    functions loader to _execute_job_function (the first version of this
+    fix) left the call on the shared minion.executors: the sudo executor
+    wrote the retcode into the sibling's __context__ and the job read its
+    own, freshly reset one, so a failed function was reported as success.
+
+    Stock 3008.x passes this by design: it runs on the shared minion.functions
+    and minion.executors and reads the shared minion.functions back, so its
+    write and its read both land in the sibling's generation here. This
+    guards against loader ownership breaking the sudo case.
+    """
+    minion_opts["sudo_user"] = "saltdev"
+    state = {}
+    calls = []
+    with _threaded_minion_61830(minion_opts) as (
+        minion,
+        delivered,
+    ), _sudo_available_61830():
+        data = {
+            "jid": f"20260101000000{code:06d}",
+            "fun": ["test.retcode"],
+            "arg": [[code]],
+            "ret": "",
+        }
+        racing = _racing_gen_modules_61830(
+            minion, state, _fake_sudo_salt_call_61830(minion, cmd_ret, calls)
+        )
+        with patch.object(minion, "gen_modules", racing):
+            salt.minion.Minion._thread_multi_return(minion, minion.opts, data)
+
+    _assert_distinct_generations_61830(state)
+    _assert_sudo_call_61830(calls, code)
+    assert len(delivered) == 1
+    ret = delivered[0]
+    assert ret["return"]["test.retcode"] == expected_return
+    assert ret["retcode"]["test.retcode"] == expected_retcode
+    assert ret["success"]["test.retcode"] is (
+        expected_retcode == salt.defaults.exitcodes.EX_OK
+    )
+
+
+# A custom execution module for the ``dummy`` resource type, installed the way
+# saltutil.sync_* would (under extension_modules). Like salt.modules.test.retcode
+# it writes the retcode into its loader's __context__.
+RESOURCE_RETCODE_MODULE_61830 = """
+def retcode(code=42):
+    __context__["retcode"] = code
+    return True
+"""
+
+
+@pytest.mark.parametrize(
+    "code,sibling_code",
+    [
+        # A failed resource job must be delivered as failed.
+        (42, 0),
+        # Inverse must-not: a passing resource job stays passing.
+        (0, 0),
+        # Inverse must-not: a failing sibling's retcode on the shared
+        # resource loader must not leak into this passing job.
+        (0, 7),
+    ],
+    ids=["failed-job-stays-failed", "passing-job-stays-passing", "no-sibling-leak"],
+)
+def test_thread_return_resource_job_owns_job_generation_61830(
+    minion_opts, tmp_path, code, sibling_code
+):
+    """
+    #61830, resource jobs: a job with ``data["resource_target"]`` runs its
+    function on the per-type execution loader for that resource type and
+    reads its retcode back from that loader's ``__context__``. The per-type
+    loaders are built by gen_modules() with that call's context, and stock
+    3008.x (and the first version of this fix) took the loader from the
+    shared minion.resource_loaders, which every job's gen_modules() rebinds.
+
+    A sibling job's gen_modules() between this job's own gen_modules() and
+    the loader lookup made this job run on the SIBLING's resource loader; a
+    sibling resource job then reset (and wrote) the retcode on that shared
+    loader in this job's write->read window, so a failed job was reported as
+    success and a failing sibling's retcode leaked into a passing job. The
+    fix takes the loader from the generation the job's own gen_modules()
+    returned.
+
+    This drives the REAL Minion._thread_return, on its own job thread as a
+    threaded minion runs it, with a production-shaped resource job (what
+    _handle_payload dispatches for ``T@dummy:dummy-01``): real pillar-driven
+    discovery of the shipped ``dummy`` resource type, the real per-type loader
+    from salt.loader.resource_modules, and a custom ``dummy`` resource
+    execution module under extension_modules whose function writes the
+    retcode into its loader's __context__.
+    """
+    moddir = tmp_path / "extmods" / "resources" / "dummy" / "modules"
+    moddir.mkdir(parents=True)
+    with salt.utils.files.fopen(str(moddir / "rctest.py"), "w") as fp_:
+        fp_.write(RESOURCE_RETCODE_MODULE_61830)
+    minion_opts["extension_modules"] = str(tmp_path / "extmods")
+    pillar = {"resources": {"dummy": {"resource_ids": ["dummy-01"]}}}
+    resource = {"id": "dummy-01", "type": "dummy"}
+    state = {}
+
+    with _threaded_minion_61830(minion_opts, pillar=pillar) as (minion, delivered):
+        original_info = salt.minion.log.info
+
+        def sibling_starts_info(msg, *args, **kwargs):
+            # A sibling resource job starts on the shared per-type loader in
+            # this job's write->read window.
+            if "execution finished" in str(msg) and not state.get("sibling_ran"):
+                state["sibling_ran"] = True
+                _sibling_job_61830(
+                    minion,
+                    minion.resource_loaders["dummy"],
+                    sibling_code,
+                    fun="rctest.retcode",
+                )
+            return original_info(msg, *args, **kwargs)
+
+        data = {
+            "jid": f"20260101000000{code:06d}",
+            "fun": "rctest.retcode",
+            "arg": [code],
+            "ret": "",
+            "tgt": "T@dummy:dummy-01",
+            "tgt_type": "compound",
+            "resource_targets": [resource],
+            "pure_resource_target": True,
+            "minion_is_target": False,
+            "resource_target": resource,
+            "resource_job": True,
+        }
+        with patch.object(
+            minion, "gen_modules", _racing_gen_modules_61830(minion, state)
+        ), patch.object(salt.minion.log, "info", sibling_starts_info):
+            _run_job_thread_61830(salt.minion.Minion._thread_return, minion, data)
+
+    assert state.get("sibling_ran"), "sibling job never ran in the window"
+    _assert_distinct_generations_61830(state)
+    job_loader = state["job_resource_loaders"]["dummy"]
+    sibling_loader = state["sibling_resource_loaders"]["dummy"]
+    assert job_loader is not sibling_loader
+    assert job_loader.pack["__context__"] is not sibling_loader.pack["__context__"]
+    assert len(delivered) == 1
+    ret = delivered[0]
+    assert ret["resource_id"] == "dummy-01"
+    assert ret["return"] is True
+    assert ret["retcode"] == code
+    assert ret["success"] is (code == salt.defaults.exitcodes.EX_OK)
+    # The job's function ran on, and wrote its retcode into, the per-type
+    # loader of the generation its own gen_modules() built.
+    assert job_loader.pack["__context__"].get("retcode") == code
+    # The resource_target the job set stayed on the job's thread.
+    assert salt.loader.context.resource_ctxvar.get() == {}
+
+
+# state.apply for the ``dummy`` resource type, installed under
+# extension_modules like RESOURCE_RETCODE_MODULE_61830: a one-state run whose
+# state fails when the job applies ``failing``. It leaves the retcode to the
+# executor below.
+RESOURCE_STATE_MODULE_61830 = """
+def apply(mods=None):
+    return {
+        "test_|-check_|-check_|-check": {
+            "name": "check",
+            "result": mods != "failing",
+            "comment": "",
+            "changes": {},
+            "__run_num__": 0,
+        }
+    }
+"""
+
+# A custom executor, installed the way saltutil.sync_executors would (under
+# extension_modules) and selected with ``salt --module-executors``. Like the
+# sudo executor it records the job's retcode in its own __context__ instead of
+# leaving that to the function: a state run with a failed state is
+# EX_STATE_FAILURE.
+STATE_RETCODE_EXECUTOR_61830 = """
+import salt.defaults.exitcodes
+
+
+def execute(opts, data, func, args, kwargs):
+    ret = func(*args, **kwargs)
+    if not all(state["result"] for state in ret.values()):
+        __context__["retcode"] = salt.defaults.exitcodes.EX_STATE_FAILURE
+    return ret
+"""
+
+
+@pytest.mark.parametrize(
+    "mods,sibling_code,expected",
+    [
+        # A failed resource state run must be delivered as failed.
+        ("failing", 0, salt.defaults.exitcodes.EX_STATE_FAILURE),
+        # Inverse must-not: a passing resource state run stays passing.
+        ("passing", 0, salt.defaults.exitcodes.EX_OK),
+        # Inverse must-not: a failing sibling's retcode on the shared
+        # resource loader must not leak into this passing run.
+        ("passing", 7, salt.defaults.exitcodes.EX_OK),
+    ],
+    ids=["failed-run-stays-failed", "passing-run-stays-passing", "no-sibling-leak"],
+)
+def test_thread_return_merge_resource_job_owns_job_generation_61830(
+    minion_opts, tmp_path, mods, sibling_code, expected
+):
+    """
+    #61830, merge-mode resource jobs: for a state function in
+    ``_MERGE_RESOURCE_FUNS`` aimed only at resources (``salt -C
+    'T@dummy:dummy-01' state.apply``) the managing minion runs no job of its
+    own. _thread_return's merge block runs the function once per resource on
+    that resource type's per-type loader, through the job's executors, reads
+    each resource's retcode back from the per-type loader's __context__ and
+    sends one return per resource.
+
+    All of those resolve against one loader generation only if the block
+    takes both the per-type loader and the executors from the generation the
+    job's own gen_modules() call returned. Stock 3008.x and the first version
+    of this fix took the per-type loader from the shared
+    minion.resource_loaders and ran through the shared minion.executors,
+    both of which a sibling job's gen_modules() rebinds:
+
+    - on the shared per-type loader, a sibling resource job's retcode reset
+      and its own retcode write, landing between this run's
+      _execute_job_function return and the retcode read, replaced this run's
+      retcode: a failed run was delivered as success, and a failing
+      sibling's retcode leaked into a passing run;
+    - an executor that records the retcode itself (as sudo does) wrote it
+      into the __context__ of the generation the executor belongs to, so
+      running through the sibling's executors put a failed run's retcode in
+      the sibling's __context__ and left this run's freshly reset one: a
+      failed run was delivered as success.
+
+    This drives the REAL Minion._thread_return on its own job thread with a
+    production-shaped merge-mode job (what _target_load hands to
+    _handle_decoded_payload for a pure resource target): real pillar-driven
+    discovery of the shipped ``dummy`` resource type, the real per-type
+    loader, a custom ``dummy`` state.apply under extension_modules, and a
+    custom executor under extension_modules that records the retcode. A real
+    sibling gen_modules() runs right after the job's own, and a sibling
+    resource job's real _execute_job_function runs on the shared per-type
+    loader right after this run's _execute_job_function returns.
+    """
+    extmods = tmp_path / "extmods"
+    moddir = extmods / "resources" / "dummy" / "modules"
+    moddir.mkdir(parents=True)
+    with salt.utils.files.fopen(str(moddir / "state.py"), "w") as fp_:
+        fp_.write(RESOURCE_STATE_MODULE_61830)
+    with salt.utils.files.fopen(str(moddir / "rctest.py"), "w") as fp_:
+        fp_.write(RESOURCE_RETCODE_MODULE_61830)
+    execdir = extmods / "executors"
+    execdir.mkdir()
+    with salt.utils.files.fopen(str(execdir / "staterc.py"), "w") as fp_:
+        fp_.write(STATE_RETCODE_EXECUTOR_61830)
+    minion_opts["extension_modules"] = str(extmods)
+    pillar = {"resources": {"dummy": {"resource_ids": ["dummy-01"]}}}
+    resource = {"id": "dummy-01", "type": "dummy"}
+    state = {}
+
+    with _threaded_minion_61830(minion_opts, pillar=pillar) as (minion, delivered):
+        real_exec = salt.minion.Minion._execute_job_function
+
+        def racing_exec(self, *args, **kwargs):
+            # This run's function returns and the executor records its
+            # retcode; then a sibling resource job runs on the shared per-type
+            # loader before the merge block reads the retcode back.
+            result = real_exec(self, *args, **kwargs)
+            if not state.get("sibling_ran"):
+                state["sibling_ran"] = True
+                _sibling_job_61830(
+                    minion,
+                    minion.resource_loaders["dummy"],
+                    sibling_code,
+                    fun="rctest.retcode",
+                    exec_fn=real_exec,
+                )
+            return result
+
+        data = {
+            "jid": f"20260101000000{expected:03d}{sibling_code:03d}",
+            "fun": "state.apply",
+            "arg": [mods],
+            "ret": "",
+            "tgt": "T@dummy:dummy-01",
+            "tgt_type": "compound",
+            "module_executors": ["staterc"],
+            "resource_targets": [resource],
+            "pure_resource_target": True,
+            "minion_is_target": True,
+        }
+        with patch.object(
+            minion, "gen_modules", _racing_gen_modules_61830(minion, state)
+        ), patch.object(salt.minion.Minion, "_execute_job_function", racing_exec):
+            _run_job_thread_61830(salt.minion.Minion._thread_return, minion, data)
+
+    assert state.get("sibling_ran"), "sibling job never ran in the window"
+    _assert_distinct_generations_61830(state)
+    job_loader = state["job_resource_loaders"]["dummy"]
+    sibling_loader = state["sibling_resource_loaders"]["dummy"]
+    assert job_loader is not sibling_loader
+    assert job_loader.pack["__context__"] is not sibling_loader.pack["__context__"]
+    # One return, for the resource, and none under the managing minion's id.
+    assert len(delivered) == 1
+    ret = delivered[0]
+    assert ret["resource_id"] == "dummy-01"
+    assert ret["fun"] == "state.apply"
+    assert ret["out"] == "highstate"
+    assert ret["return"] == {
+        "test_|-check_|-check_|-check": {
+            "name": "check",
+            "result": mods != "failing",
+            "comment": "",
+            "changes": {},
+            "__run_num__": 0,
+        }
+    }
+    assert ret["retcode"] == expected
+    assert ret["success"] is (expected == salt.defaults.exitcodes.EX_OK)
+    # The run's retcode lives in, and was read from, the generation the job's
+    # own gen_modules() built; the sibling's per-type loader only holds the
+    # sibling's own retcode.
+    assert job_loader.pack["__context__"].get("retcode") == expected
+    assert sibling_loader.pack["__context__"].get("retcode") == sibling_code
+
+
+def test_sys_reload_modules_returns_none_and_is_serializable_61830(minion_opts):
+    """
+    #61830 follow-on: gen_modules() now returns the loaders it built (a
+    ModuleGeneration holding the functions, executors and resource_loaders it
+    just bound to the minion) so a threaded job can run against them.
+    LazyLoaders are not serializable, so sys.reload_modules must not be bound
+    to gen_modules directly (its return would be put on the wire). It is bound
+    to _reload_modules, which reloads the modules and returns None.
+    """
+    minion_opts["file_client"] = "local"
+    io_loop = tornado.ioloop.IOLoop()
+    minion = salt.minion.Minion(minion_opts, io_loop=io_loop)
+    try:
+        minion.gen_modules()
+        before = minion.functions
+        reload_fn = minion.functions["sys.reload_modules"]
+        result = reload_fn()
+        assert result is None
+        # It really reloaded the modules.
+        assert minion.functions is not before
+        # The wire payload must round-trip without raising.
+        salt.payload.dumps({"return": result})
+
+        # gen_modules() itself returns the generation it just bound to the
+        # minion attributes.
+        generation = minion.gen_modules()
+        assert isinstance(generation, salt.minion.ModuleGeneration)
+        assert generation.functions is minion.functions
+        assert generation.executors is minion.executors
+        assert generation.resource_loaders is minion.resource_loaders
+        # The loaders of one generation share that call's __context__.
+        assert (
+            generation.executors.pack["__context__"]
+            is generation.functions.pack["__context__"]
+        )
+        # That return value is not serializable, which is exactly why
+        # sys.reload_modules needs the None-returning wrapper.
+        with pytest.raises(TypeError):
+            salt.payload.dumps({"return": generation})
+    finally:
+        minion.destroy()
+
+
+def test_sys_doc_reload_modules_shows_user_docstring_61830(minion_opts):
+    """
+    #61830 follow-on: sys.reload_modules is served by whatever gen_modules()
+    binds to it, so ``salt '*' sys.doc sys.reload_modules`` shows that
+    callable's docstring, not the stub in salt/modules/sysmod.py (whose
+    comment says its docstring must be mirrored in minion.py). Binding it to
+    the _reload_modules wrapper must keep the user-facing text there; the
+    first version of this fix showed the wrapper's internal notes instead.
+    """
+    minion_opts["file_client"] = "local"
+    io_loop = tornado.ioloop.IOLoop()
+    minion = salt.minion.Minion(minion_opts, io_loop=io_loop)
+    try:
+        minion.gen_modules()
+        docs = minion.functions["sys.doc"]("sys.reload_modules")
+    finally:
+        minion.destroy()
+
+    assert list(docs) == ["sys.reload_modules"]
+    # sys.doc strips the reST directives; compare what it shows with the same
+    # processing of the sysmod stub's docstring (the online docs).
+    expected = salt.utils.doc.strip_rst(
+        {"sys.reload_modules": salt.modules.sysmod.reload_modules.__doc__}
+    )["sys.reload_modules"]
+    assert inspect.cleandoc(docs["sys.reload_modules"]) == inspect.cleandoc(expected)
+    assert inspect.cleandoc(docs["sys.reload_modules"]) == (
+        "Tell the minion to reload the execution modules\n"
+        "\n"
+        "CLI Example:\n"
+        "\n"
+        "    salt '*' sys.reload_modules"
+    )
+
+
+def test_thread_multi_return_retcode_owns_captured_loader_61830(minion_opts):
+    """
+    #61830, multi-function path. On 3008.x the single-function path already
+    captures one loader for the retcode reset, write and read, but
+    _thread_multi_return still called _execute_job_function without a loader
+    (so the call ran on the shared minion.functions and minion.executors) and
+    read each function's retcode back from the shared minion.functions. With
+    multiprocessing=False every job's gen_modules() rebinds those attributes,
+    so the write->read desync remains on this path (and in the proxy and
+    deltaproxy job runners):
+
+    - a sibling job's gen_modules() between this job's own gen_modules() and
+      the function call makes the function run on the sibling's loader;
+    - a sibling job's start-of-job retcode reset and its own retcode write on
+      the shared loader, landing between this job's retcode write and its
+      read, change what this job delivers.
+
+    A failed function was reported as success, and a failing sibling's
+    retcode leaked into a passing function. The fix passes the functions and
+    executors of the generation the job's own gen_modules() returned to
+    _execute_job_function and reads the retcode back from that generation.
+
+    Both windows are forced with real code: a real sibling gen_modules() right
+    after the job's own, and the sibling job's real _execute_job_function on
+    the sibling's loader right after this job's function returns.
+    """
+    with _threaded_minion_61830(minion_opts) as (minion, delivered):
+        real_exec = salt.minion.Minion._execute_job_function
+        state = {}
+
+        def racing_exec(self, *args, **kwargs):
+            # The job's function writes its retcode; then the sibling job runs
+            # on the sibling's loader before _thread_multi_return reads the
+            # retcode back.
+            result = real_exec(self, *args, **kwargs)
+            if not state.get("sibling_ran"):
+                state["sibling_ran"] = True
+                _sibling_job_61830(
+                    minion,
+                    state["sibling_functions"],
+                    state["sibling_code"],
+                    exec_fn=real_exec,
+                )
+            return result
+
+        def run(code, sibling_code=0):
+            delivered.clear()
+            state.clear()
+            state["sibling_code"] = sibling_code
+            data = {
+                "jid": f"20260101000000{code:06d}",
+                "fun": ["test.retcode"],
+                "arg": [[code]],
+                "ret": "",
+            }
+            with patch.object(
+                minion, "gen_modules", _racing_gen_modules_61830(minion, state)
+            ), patch.object(salt.minion.Minion, "_execute_job_function", racing_exec):
+                salt.minion.Minion._thread_multi_return(minion, minion.opts, data)
+            assert state.get("sibling_ran"), "sibling job never ran in the window"
+            _assert_distinct_generations_61830(state)
+            assert len(delivered) == 1
+            return delivered[0]
+
+        # A FAILED function (retcode 42) whose sibling passes must be delivered
+        # as failed. Pre-fix this delivered retcode=0/success=True.
+        ret = run(42)
+        assert ret["retcode"]["test.retcode"] == 42
+        assert ret["success"]["test.retcode"] is False
+        # The retcode lives in, and was read from, the loader this job built.
+        assert state["job_functions"].pack["__context__"]["retcode"] == 42
+        assert (
+            state["sibling_functions"].pack["__context__"]["retcode"]
+            == salt.defaults.exitcodes.EX_OK
+        )
+
+        # Inverse must-not: a SUCCEEDING function (retcode 0) under the same
+        # forced interleave must still be delivered as success.
+        ret = run(0)
+        assert ret["retcode"]["test.retcode"] == salt.defaults.exitcodes.EX_OK
+        assert ret["success"]["test.retcode"] is True
+
+        # Inverse must-not: a FAILING sibling (retcode 7) must not leak its
+        # retcode into a passing function. Pre-fix this was delivered as
+        # retcode=7/success=False.
+        ret = run(0, sibling_code=7)
+        assert ret["retcode"]["test.retcode"] == salt.defaults.exitcodes.EX_OK
+        assert ret["success"]["test.retcode"] is True
 
 
 def test_minion_manage_schedule(minion_opts):
@@ -1561,6 +3210,88 @@ def test_minion_manage_schedule(minion_opts):
 
                 minion.manage_schedule(tag, data)
                 assert "test_job" in minion.opts["schedule"]
+            finally:
+                del minion.schedule
+                minion.destroy()
+                del minion
+
+
+def test_minion_keeps_schedule_on_master_reconnect(minion_opts):
+    """
+    Tests that re-initialising the subsystems after reconnecting to a master
+    does not replace the in-memory schedule with the one seen by the loaders,
+    which can be stale or empty.
+    """
+    minion_opts["master_alive_interval"] = 0
+    with patch("salt.minion.Minion.ctx", MagicMock(return_value={})), patch(
+        "salt.minion.Minion.sync_connect_master",
+        MagicMock(side_effect=RuntimeError("stop execution")),
+    ), patch(
+        "salt.utils.process.SignalHandlingProcess.start",
+        MagicMock(return_value=True),
+    ), patch(
+        "salt.utils.process.SignalHandlingProcess.join",
+        MagicMock(return_value=True),
+    ):
+        io_loop = tornado.ioloop.IOLoop()
+        io_loop.make_current()
+
+        with patch("salt.utils.schedule.clean_proc_dir", MagicMock(return_value=None)):
+            try:
+                # the loaders see a stale (empty) schedule
+                mock_functions = {
+                    "test.ping": None,
+                    "config.merge": MagicMock(return_value={}),
+                }
+
+                minion = salt.minion.Minion(minion_opts, io_loop=io_loop)
+                minion.opts["schedule"] = {
+                    "__mine_interval": {
+                        "function": "mine.update",
+                        "minutes": 60,
+                        "jid_include": True,
+                        "maxrunning": 2,
+                        "return_job": False,
+                    },
+                    "test_job": {
+                        "function": "test.ping",
+                        "seconds": 3600,
+                    },
+                }
+                expected = copy.deepcopy(minion.opts["schedule"])
+                minion.schedule = salt.utils.schedule.Schedule(
+                    minion.opts,
+                    mock_functions,
+                    returners={},
+                    new_instance=True,
+                )
+                minion.ready = True
+                minion.connected = True
+
+                @tornado.gen.coroutine
+                def mock_eval_master(*args, **kwargs):
+                    minion.connected = True
+                    return minion.opts["master"], MagicMock()
+
+                package = salt.utils.stringutils.to_bytes(
+                    salt.minion.master_event(type="disconnected") + event.TAGEND
+                ) + salt.payload.dumps({"master": minion.opts["master"]})
+
+                mock_load_modules = MagicMock(return_value=(mock_functions, {}, {}, {}))
+                with patch.object(minion, "eval_master", mock_eval_master), patch(
+                    "salt.channel.client.AsyncReqChannel.factory",
+                    MagicMock(return_value=MagicMock(connect=AsyncMock())),
+                ), patch.object(
+                    minion, "_load_modules", mock_load_modules
+                ), patch.object(
+                    minion, "_fire_master_minion_start", AsyncMock()
+                ):
+                    io_loop.run_sync(lambda: minion.handle_event(package))
+
+                assert minion.connected
+                mock_load_modules.assert_called_once()
+                assert minion.opts["schedule"] == expected
+                assert minion.schedule.opts["schedule"] == expected
             finally:
                 del minion.schedule
                 minion.destroy()
@@ -1984,20 +3715,167 @@ async def test_syndic_async_req_channel(syndic_opts):
     assert isinstance(syndic.async_req_channel, salt.channel.client.AsyncReqChannel)
 
 
-@pytest.mark.slow_test
-def test_load_args_and_kwargs(minion_opts):
-    """
-    Ensure load_args_and_kwargs performs correctly
-    """
-    _args = [{"max": 40, "__kwarg__": True}]
-    ret = salt.minion.load_args_and_kwargs(test_mod.rand_sleep, _args)
-    assert ret == ([], {"max": 40})
-    assert all([True if "__kwarg__" in item else False for item in _args])
+@pytest.mark.parametrize(
+    "fun,args,expected",
+    (
+        # No arguments
+        pytest.param(_noparams, [], ([], {}), id="no_params"),
+        # Plain positional arguments
+        pytest.param(_nodefault, [1, 2, 3], ([1, 2, 3], {}), id="poskw_req_by_pos"),
+        # Non-string arguments and dicts without __kwarg__ stay positional
+        pytest.param(
+            _nodefault,
+            [{"first": 1}, [2], None],
+            ([{"first": 1}, [2], None], {}),
+            id="kw_requires_dict_with_kwarg_key",
+        ),
+        # __kwarg__ dicts are parsed into kwargs
+        pytest.param(
+            _default,
+            [1, 2, {"third": 3, "__kwarg__": True}],
+            ([1, 2], {"third": 3}),
+            id="dict_with_kwarg_key_to_single_kwarg",
+        ),
+        # A single __kwarg__ dict can specify multiple kwargs
+        pytest.param(
+            _default,
+            [1, {"second": 2, "third": 3, "__kwarg__": True}],
+            ([1], {"second": 2, "third": 3}),
+            id="dict_with_kwarg_key_to_multiple_kwargs",
+        ),
+        # String kwargs are parsed, their values are yamlified
+        pytest.param(
+            _default, [1, 2, "third=3"], ([1, 2], {"third": 3}), id="string_to_kwarg"
+        ),
+        # Strings that don't parse as kwargs stay positional
+        pytest.param(
+            _nodefault,
+            ["one", "a==b", "key = val"],
+            (["one", "a==b", "key = val"], {}),
+            id="string_no_kwarg",
+        ),
+        # Keyword-only parameters are valid kwargs, as dicts and strings
+        pytest.param(
+            _kwonly_req,
+            [1, {"third": 3, "__kwarg__": True}],
+            ([1], {"third": 3}),
+            id="kwonly_from_dict",
+        ),
+        pytest.param(
+            _kwonly_no_pos,
+            ["second=2", "third=3"],
+            ([], {"second": 2, "third": 3}),
+            id="kwonly_from_string",
+        ),
+        # Positional-only parameters are passed positionally
+        pytest.param(_posonly, [1, 2, 3, 4], ([1, 2, 3, 4], {}), id="posonly_by_pos"),
+        # Unknown names are valid kwargs when the function accepts **kwargs
+        pytest.param(
+            _kwargs,
+            [1, {"fourth": 4, "__kwarg__": True}, "fifth=5"],
+            ([1], {"fourth": 4, "fifth": 5}),
+            id="unknown_named_into_variadic_keywords",
+        ),
+        # Positional-only names are valid kwargs with **kwargs present,
+        # where they end up as keyword arguments (mirroring Python)
+        pytest.param(
+            _all,
+            [1, {"second": 2, "__kwarg__": True}],
+            ([1], {"second": 2}),
+            id="posonly_name_into_kwargs",
+        ),
+        # Real execution module function
+        pytest.param(
+            test_mod.rand_sleep,
+            [{"max": 40, "__kwarg__": True}],
+            ([], {"max": 40}),
+            id="real_module",
+        ),
+    ),
+)
+def test_load_args_and_kwargs(fun, args, expected):
+    ret = salt.minion.load_args_and_kwargs(fun, args)
+    assert ret == expected
 
-    # Test invalid arguments
-    _args = [{"max_sleep": 40, "__kwarg__": True}]
-    with pytest.raises(salt.exceptions.SaltInvocationError):
-        ret = salt.minion.load_args_and_kwargs(test_mod.rand_sleep, _args)
+
+@pytest.mark.parametrize(
+    "fun,args,match",
+    (
+        # Unknown kwarg name without **kwargs to receive it (dict form)
+        pytest.param(
+            _default,
+            [1, {"fourth": 4, "__kwarg__": True}],
+            r"not valid: fourth=4",
+            id="unknown_kwarg_from_dict",
+        ),
+        # Unknown kwarg name without **kwargs to receive it (string form)
+        pytest.param(
+            _default,
+            [1, "fourth=4"],
+            r"not valid: fourth=4",
+            id="unknown_kwarg_from_string",
+        ),
+        # Positional-only parameters cannot be passed by name
+        pytest.param(
+            _posonly,
+            [{"first": 1, "__kwarg__": True}, 2, 3],
+            r"not valid: first=1",
+            id="posonly_req_by_name",
+        ),
+        pytest.param(
+            _posonly_default_no_regular,
+            [1, "second=2"],
+            r"not valid: second=2",
+            id="posonly_default_by_name",
+        ),
+        # All invalid kwargs are collected into a single error
+        pytest.param(
+            _default,
+            [{"fourth": 4, "__kwarg__": True}, "fifth=5"],
+            r"not valid: fourth=4, fifth=5",
+            id="unknown_kwarg_multi",
+        ),
+    ),
+)
+def test_load_args_and_kwargs_invalid_kwargs(fun, args, match):
+    with pytest.raises(salt.exceptions.SaltInvocationError, match=match):
+        salt.minion.load_args_and_kwargs(fun, args)
+
+
+def test_load_args_and_kwargs_ignore_invalid():
+    """
+    With ignore_invalid=True, invalid kwargs are dropped silently.
+    """
+    args = [1, {"third": 3, "fourth": 4, "__kwarg__": True}, "fifth=5"]
+    ret = salt.minion.load_args_and_kwargs(_default, args, ignore_invalid=True)
+    assert ret == ([1], {"third": 3})
+
+
+def test_load_args_and_kwargs_pub_data():
+    """
+    Publish data is packed into __pub_* kwargs, but only if the
+    function accepts **kwargs.
+    """
+    data = {"jid": "20240101000000000000", "user": "root"}
+    ret = salt.minion.load_args_and_kwargs(_kwargs, [1], data=data)
+    assert ret == (
+        [1],
+        {"__pub_jid": "20240101000000000000", "__pub_user": "root"},
+    )
+
+    ret = salt.minion.load_args_and_kwargs(_default, [1, 2], data=data)
+    assert ret == ([1, 2], {})
+
+
+def test_load_args_and_kwargs_input_not_modified():
+    """
+    The input argument list is passed on the wire and reused (e.g. in the
+    job cache), ensure __kwarg__ markers are not stripped from it.
+    """
+    args = [1, {"third": 3, "__kwarg__": True}]
+    ret = salt.minion.load_args_and_kwargs(_default, args)
+    assert ret == ([1], {"third": 3})
+    assert args == [1, {"third": 3, "__kwarg__": True}]
 
 
 async def test_connect_master_salt_client_error(minion_opts, connect_master_mock):
@@ -2050,6 +3928,167 @@ async def test_connect_master_general_exception_error(minion_opts, connect_maste
     # The first call raised an error which caused minion.destroy to get called,
     # the second call is a success.
     assert minion.connect_master.calls == 2
+
+
+async def test_connect_master_cluster_not_ready_is_quiet(
+    minion_opts, connect_master_mock, caplog
+):
+    """
+    Regression test for the cluster-bootstrap log-noise issue (#70727).
+
+    When a clustered master defers the initial pillar fetch with the
+    ``cluster_retry`` sentinel, the minion's multi-master connect loop must:
+
+    1. Log a single ``INFO`` retry notice instead of a full ``log.error``
+       with traceback for "Error while bringing up minion for multi-master".
+    2. Reset ``_running`` after ``destroy()`` so the subsequent successful
+       ``tune_in(start=False)`` does not trip the "scheduled to stop" branch
+       in ``_pre_tune``.
+    """
+    import salt.crypt
+    from salt.channel.client import CLUSTER_NOT_READY_SUFFIX
+
+    minion_opts["acceptance_wait_time"] = 0
+
+    # Build a SaltClientError whose ``__cause__`` carries the cluster-not-ready
+    # sentinel message exactly as ``AsyncPillar.compile_pillar`` re-raises it.
+    auth_exc = salt.crypt.AuthenticationError(
+        "Master did not return a session key for pillar request"
+        + CLUSTER_NOT_READY_SUFFIX
+    )
+    chained = SaltClientError("Exception getting pillar.")
+    chained.__cause__ = auth_exc
+
+    class _RaiseCausedSaltClientError:
+        calls = 0
+
+        async def __call__(self, *args, **kwargs):
+            _RaiseCausedSaltClientError.calls += 1
+            if _RaiseCausedSaltClientError.calls == 1:
+                raise chained
+            return True
+
+    mm = salt.minion.MinionManager(minion_opts)
+    minion = salt.minion.Minion(minion_opts)
+    minion.connect_master = _RaiseCausedSaltClientError()
+
+    # ``_pre_tune`` would otherwise log "scheduled to stop" when _running
+    # stays ``False``.  Record the state the retry loop leaves ``_running``
+    # in when the retry-and-recover path runs.
+    seen_running_values = []
+    original_tune_in = minion.tune_in
+
+    def _capture_tune_in(*args, **kwargs):
+        seen_running_values.append(minion._running)
+        # Short-circuit the real tune_in so the test does not set up IPC.
+        return None
+
+    minion.tune_in = _capture_tune_in
+    minion.destroy = MagicMock(wraps=minion.destroy)
+
+    with caplog.at_level(logging.DEBUG, logger="salt.minion"):
+        await mm._connect_minion(minion)
+
+    # destroy() ran exactly once on the failed first attempt.
+    minion.destroy.assert_called_once()
+    # Two calls to connect_master: the first raised, the second succeeded.
+    assert minion.connect_master.calls == 2
+
+    # Fix 1: the retry loop logged at INFO (not ERROR) with a short retry
+    # message, and did not emit the alarming "Error while bringing up minion
+    # for multi-master" ERROR + traceback.
+    error_records = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.ERROR
+        and "Error while bringing up minion for multi-master" in r.getMessage()
+    ]
+    assert error_records == [], (
+        "cluster-not-ready retry should not log the bringing-up-minion ERROR; "
+        f"got {[r.getMessage() for r in error_records]}"
+    )
+    info_records = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.INFO
+        and "is still catching up (cluster not ready)" in r.getMessage()
+    ]
+    assert len(info_records) == 1, (
+        "cluster-not-ready retry should log exactly one INFO notice; "
+        f"got {[r.getMessage() for r in info_records]}"
+    )
+
+    # Fix 2: _running was reset after destroy() so the subsequent
+    # tune_in(start=False) did not land in _pre_tune's "scheduled to stop"
+    # branch.  ``_pre_tune`` treats both ``None`` and ``True`` as "fine, run
+    # tune_in"; only ``False`` means "we already called destroy()".
+    assert seen_running_values == [None], (
+        "_running must be reset to None after destroy() so the successful "
+        f"retry can actually bind; got {seen_running_values}"
+    )
+    scheduled_to_stop = [
+        r for r in caplog.records if "scheduled to stop" in r.getMessage()
+    ]
+    assert scheduled_to_stop == [], (
+        "retry-and-recover must not trip the 'scheduled to stop' ERROR; "
+        f"got {[r.getMessage() for r in scheduled_to_stop]}"
+    )
+
+
+async def test_connect_master_non_cluster_salt_client_error_still_logs_error(
+    minion_opts, connect_master_mock, caplog
+):
+    """
+    Non-cluster ``SaltClientError`` on the connect loop must keep the
+    existing ERROR + traceback path — the quieting is scoped strictly to the
+    cluster-not-ready sentinel.
+    """
+    minion_opts["acceptance_wait_time"] = 0
+
+    mm = salt.minion.MinionManager(minion_opts)
+    minion = salt.minion.Minion(minion_opts)
+    connect_master_mock.exc = SaltClientError
+    minion.connect_master = connect_master_mock
+    minion.destroy = MagicMock(wraps=minion.destroy)
+    minion.tune_in = MagicMock()
+
+    with caplog.at_level(logging.DEBUG, logger="salt.minion"):
+        await mm._connect_minion(minion)
+
+    error_records = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.ERROR
+        and "Error while bringing up minion for multi-master" in r.getMessage()
+    ]
+    assert len(error_records) == 1
+
+
+def test_cluster_not_ready_suffix_detector_round_trip():
+    """
+    Lock in the sentinel contract between
+    ``AsyncReqChannel.crypted_transfer_decode_dictentry`` (raiser) and the
+    detectors used by the pillar and minion modules (quiet-logging consumers).
+    """
+    from salt.channel.client import (
+        CLUSTER_NOT_READY_SUFFIX,
+        _is_cluster_not_ready_message,
+    )
+
+    # The exact message string raised by the channel.
+    msg = (
+        "Master did not return a session key for pillar request"
+        + CLUSTER_NOT_READY_SUFFIX
+    )
+    assert _is_cluster_not_ready_message(msg) is True
+
+    # Ordinary auth failures do not match — they stay at ERROR.
+    assert _is_cluster_not_ready_message("Key verification failed.") is False
+    assert _is_cluster_not_ready_message("Pillar nonce verification failed.") is False
+
+    # Non-string inputs never match (defensive against ``exc.message is None``).
+    assert _is_cluster_not_ready_message(None) is False
+    assert _is_cluster_not_ready_message(b"cluster not ready") is False
 
 
 async def test_minion_manager_async_stop(io_loop, minion_opts, tmp_path):
@@ -2113,6 +4152,56 @@ async def test_minion_manager_async_stop(io_loop, minion_opts, tmp_path):
     parent_signal_handler.assert_called_once_with(signal.SIGTERM, None)
     assert mm.event_publisher is None
     assert mm.event is None
+
+
+async def test_minion_manager_destroy_closes_event_publisher(
+    io_loop, minion_opts, tmp_path
+):
+    """
+    Regression test for issue #70175.
+
+    ``MinionManager.destroy()`` is invoked from
+    ``cli.daemons.Minion.shutdown()`` (KeyboardInterrupt, SaltSystemExit,
+    the ``shutdown(1)`` guard in ``prepare()``) and from
+    ``MinionManager.__del__`` on GC.  It must close the ``event_publisher``
+    ``PublishServer`` graph -- otherwise the three-warning cascade
+    from #70175 fires at interpreter shutdown:
+
+      - ``unclosed publish server <PublishServer>``
+      - ``unclosed SyncWrapper for cls=<_TCPPubServerPublisher>``
+      - ``unclosed publisher client <_TCPPubServerPublisher>``
+
+    Only the ``stop_async`` shutdown path (invoked from the SIGTERM
+    signal handler) used to close these; ``destroy()`` did not, so any
+    non-SIGTERM exit leaked them.
+    """
+    minion_opts["sock_dir"] = str(tmp_path / "sock")
+    os.makedirs(minion_opts["sock_dir"])
+
+    mm = salt.minion.MinionManager(minion_opts)
+    mm._bind()
+    assert mm.event_publisher is not None
+    assert mm.event is not None
+
+    # Wait for pub server to bind so the underlying PublishServer graph
+    # is fully constructed.
+    while not list(pathlib.Path(minion_opts["sock_dir"]).glob("*")):
+        await tornado.gen.sleep(0.1)
+
+    ep = mm.event_publisher
+    ev = mm.event
+
+    # Call destroy directly (the buggy path).  Post-fix it must close
+    # both resources and null the references.
+    mm.destroy()
+
+    assert mm.event_publisher is None
+    assert mm.event is None
+    # PublishServer.close() sets _closing=True so __del__ won't warn.
+    assert ep._closing is True
+    # SaltEvent.destroy() closes pusher / subscriber and clears them.
+    assert ev.subscriber is None
+    assert ev.pusher is None
 
 
 def test_minion_io_loop_is_asyncio_loop(minion_opts):
@@ -2511,3 +4600,505 @@ async def test_stop_async_calls_notify_stopping_and_terminates_subprocess_list(
         # code path; the .destroy() call would try to tear down channels
         # we never created. A best-effort close is enough.
         pass
+
+
+def test_proxy_minion_destroy_tears_down_subproxies(minion_opts):
+    """
+    A deltaproxy holds its sub-proxies in ``deltaproxy_objs`` and each of them
+    owns its own ``req_channel``, schedule, beacons and periodic callbacks.
+    Nothing tore those down, so every stop or restart abandoned them.
+    """
+    minion_opts["metaproxy"] = "deltaproxy"
+    proxy = salt.minion.ProxyMinion.__new__(salt.minion.ProxyMinion)
+    proxy.opts = minion_opts
+
+    sub1 = MagicMock()
+    sub2 = MagicMock()
+    proxy.deltaproxy_objs = {"minion1": sub1, "minion2": sub2}
+
+    with patch.object(salt.minion.Minion, "destroy") as parent_destroy:
+        proxy.destroy()
+
+    assert sub1.destroy.called
+    assert sub2.destroy.called
+    # The control proxy itself is still torn down afterwards.
+    assert parent_destroy.called
+
+
+def test_proxy_minion_destroy_survives_a_bad_subproxy(minion_opts):
+    """
+    One sub-proxy failing to tear down must not stop the others, nor the
+    control proxy's own teardown.
+    """
+    minion_opts["metaproxy"] = "deltaproxy"
+    proxy = salt.minion.ProxyMinion.__new__(salt.minion.ProxyMinion)
+    proxy.opts = minion_opts
+
+    bad = MagicMock()
+    bad.destroy.side_effect = RuntimeError("device gone")
+    good = MagicMock()
+    proxy.deltaproxy_objs = {"minion1": bad, "minion2": good}
+
+    with patch.object(salt.minion.Minion, "destroy") as parent_destroy:
+        proxy.destroy()
+
+    assert good.destroy.called
+    assert parent_destroy.called
+
+
+def test_proxy_minion_destroy_without_subproxies(minion_opts):
+    """
+    Inverse: a single (non-delta) proxy has no ``deltaproxy_objs`` at all and
+    must still tear itself down normally.
+    """
+    proxy = salt.minion.ProxyMinion.__new__(salt.minion.ProxyMinion)
+    proxy.opts = minion_opts
+
+    with patch.object(salt.minion.Minion, "destroy") as parent_destroy:
+        proxy.destroy()
+
+    assert parent_destroy.called
+
+
+def test_terminate_subprocess_list_tolerates_thread_entries():
+    """
+    With ``multiprocessing: False`` the entries in ``SubprocessList`` are
+    ``threading.Thread`` objects, which have no ``pid`` and cannot be
+    signalled. Reading ``.pid`` raised ``AttributeError``, which is not an
+    ``OSError``, so it escaped this helper and aborted the graceful shutdown
+    before ``destroy()`` ever ran.
+    """
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def _worker():
+        started.set()
+        release.wait(5)
+
+    thread = threading.Thread(target=_worker)
+    thread.start()
+    started.wait(5)
+
+    class _SubprocessList:
+        processes = [thread]
+
+    try:
+        # Must not raise. Before the fix this blew up with AttributeError.
+        salt.minion._terminate_subprocess_list(
+            _SubprocessList(), signal.SIGTERM, grace_seconds=0.1
+        )
+    finally:
+        release.set()
+        thread.join(5)
+
+
+def test_terminate_subprocess_list_still_signals_real_processes():
+    """
+    Inverse of the above: an entry that really is a process must still be
+    signalled, so skipping the pid-less thread entries cannot turn the whole
+    helper into a no-op.
+    """
+
+    class _FakeProc:
+        pid = 4242
+
+        def is_alive(self):
+            return True
+
+        def join(self, timeout=None):
+            return None
+
+    class _SubprocessList:
+        processes = [_FakeProc()]
+
+    with patch("os.kill") as kill_mock:
+        salt.minion._terminate_subprocess_list(
+            _SubprocessList(), signal.SIGTERM, grace_seconds=0.1
+        )
+
+    assert kill_mock.called
+    assert kill_mock.call_args[0][0] == 4242
+
+
+def test_masterminion_del_silent_after_destroy():
+    """
+    Regression test for GH #70174.
+
+    ``MasterMinion.destroy()`` leaves ``returners``/``functions``/``utils``
+    as ``{}``, not ``None``, but ``__del__``'s "already torn down" check
+    looked for ``None`` specifically. So a ``MasterMinion`` that was
+    properly torn down via ``destroy()`` (e.g. by
+    ``RunnerClient.destroy()``) still fired the loud "unclosed
+    MasterMinion" WARNING at GC time.
+    """
+    import gc
+    import warnings
+
+    mm = salt.minion.MasterMinion.__new__(salt.minion.MasterMinion)
+    # Mirrors the post-destroy() state: emptied, not None.
+    mm.returners = {}
+    mm.functions = {}
+    mm.utils = {}
+    # ``gc.collect()`` can also finalize unrelated garbage left behind by
+    # other tests in the same process; scope the assertion to warnings
+    # naming *this* object so that pollution doesn't produce a false
+    # failure (or, worse, mask a real one).
+    mm_repr = repr(mm)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        del mm
+        gc.collect()
+    resource_warnings = [
+        w
+        for w in caught
+        if issubclass(w.category, ResourceWarning) and mm_repr in str(w.message)
+    ]
+    assert not resource_warnings, (
+        "A destroy()'d MasterMinion must not warn at GC; got: "
+        f"{[str(w.message) for w in resource_warnings]}"
+    )
+
+
+def test_masterminion_del_warns_when_unclosed():
+    """
+    Inverse of the above: a MasterMinion that was never destroy()'d must
+    still warn, so the "already torn down" fix doesn't silence real leaks.
+    """
+    import gc
+    import warnings
+
+    mm = salt.minion.MasterMinion.__new__(salt.minion.MasterMinion)
+    mm.returners = {"some_returner": object()}
+    mm.functions = {}
+    mm.utils = {}
+    mm_repr = repr(mm)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        del mm
+        gc.collect()
+    resource_warnings = [
+        w
+        for w in caught
+        if issubclass(w.category, ResourceWarning) and mm_repr in str(w.message)
+    ]
+    assert resource_warnings, (
+        "An un-destroyed MasterMinion must still warn at GC; got: "
+        f"{[(w.category.__name__, str(w.message)) for w in caught]}"
+    )
+    msg = str(resource_warnings[0].message)
+    assert "MasterMinion" in msg
+    assert "destroy" in msg or "context manager" in msg
+
+
+def test_masterminion_destroy_isolates_component_failures():
+    """
+    Regression test for GH #70174 review follow-up.
+
+    ``MasterMinion.destroy()`` runs several components' teardown
+    back-to-back. If an earlier component's ``.destroy()`` raises, later
+    components must still be torn down and reset to ``{}`` -- both so no
+    resource is silently leaked, and so ``destroy()`` itself never raises
+    (it's now called unconditionally from ``RunnerClient``/``WheelClient``
+    ``destroy()``, which in turn may run from a ``finally:`` block).
+    """
+    mm = salt.minion.MasterMinion.__new__(salt.minion.MasterMinion)
+    mm.returners = None
+    mm.functions = MagicMock()
+    mm.functions.destroy.side_effect = RuntimeError("boom")
+    utils = mm.utils = MagicMock()
+    mm.opts = {}
+
+    mm.destroy()  # must not raise
+
+    assert mm.functions == {}
+    utils.destroy.assert_called_once()
+    assert mm.utils == {}
+
+
+def test_minion_manager_destroy_after_closed_io_loop_does_not_raise(
+    minion_opts, tmp_path
+):
+    """
+    ``MinionManager.destroy()`` must not itself raise "RuntimeError: Event
+    loop is closed" when called on an instance whose ``io_loop`` was
+    already closed (this is exactly what happens in cli.daemons.py's
+    retry loop after a failed master reconnect: tune_in()'s own finally
+    clause closes the loop *before* destroy() is ever reached).
+
+    In particular, SaltEvent.close_pub()'s ``_connect_task.cancel()`` is
+    reachable regardless of the minion's configured transport, since the
+    local event bus is always tcp. See #70178.
+    """
+    # Deliberately not an ``async def`` test: MinionManager.__init__ only
+    # takes the ``asyncio.new_event_loop()`` branch (giving us a private
+    # loop we can safely drive/close ourselves) when there's no loop
+    # already running in the current context.
+    minion_opts["sock_dir"] = str(tmp_path / "sock")
+    os.makedirs(minion_opts["sock_dir"])
+
+    manager = salt.minion.MinionManager(minion_opts)
+    try:
+        manager._bind()
+        # Run the loop briefly so background tasks (the event publisher,
+        # SaltEvent._connect_task, ...) actually start executing and
+        # suspend on an await, rather than sitting completely unstarted
+        # -- cancelling a task that never got a single iteration doesn't
+        # exercise the "Event loop is closed" hazard being guarded here.
+        manager.io_loop.run_until_complete(asyncio.sleep(0.2))
+
+        # Close the event publisher BEFORE closing the loop so its
+        # PubServer drains its subscribers cleanly (each client's
+        # ``_stream_read`` task exits via ``StreamClosedError``).  The
+        # per-subscriber tasks are not in ``_background_tasks``, so
+        # without this they survive loop teardown and later cross a
+        # test boundary -- on CPython 3.14 asyncio then emits
+        # ``Task was destroyed but it is pending!`` from a subsequent
+        # test's caplog, breaking #70748's regression check purely as
+        # a test-cleanup artifact.  See siblings
+        # ``test_minion_manager_spawn_minions_keeps_task_reference``
+        # and ``test_minion_manager_bind_keeps_publisher_task_reference``
+        # for the equivalent drain pattern on tracked tasks.  Cancel
+        # the manager's own background tasks the same way and drain
+        # them before closing the loop.
+        if manager.event_publisher is not None:
+            with contextlib.suppress(Exception):
+                manager.event_publisher.close()
+        for task in list(manager._background_tasks):
+            task.cancel()
+        with contextlib.suppress(Exception):
+            manager.io_loop.run_until_complete(
+                asyncio.gather(*manager._background_tasks, return_exceptions=True)
+            )
+        manager.io_loop.close()
+
+        manager.destroy()
+    finally:
+        if not manager.io_loop.is_closed():
+            manager.io_loop.close()
+
+
+# Follow-up to PR #70733: ensure fire-and-forget background coroutines spawned
+# on the minion's io_loop keep a strong reference until they complete, so
+# CPython's garbage collector can't destroy the Task mid-``await`` and emit
+# ``Task was destroyed but it is pending!``.  Issue #70748.
+
+
+def _assert_no_task_destroyed_warning(records):
+    """
+    Fail if asyncio emitted ``Task was destroyed but it is pending!`` via
+    the stdlib ``asyncio`` logger during the captured records.
+    """
+    offenders = [
+        rec
+        for rec in records
+        if "Task was destroyed but it is pending" in rec.getMessage()
+    ]
+    assert not offenders, (
+        "asyncio emitted 'Task was destroyed but it is pending!' - "
+        f"{len(offenders)} occurrence(s): "
+        f"{[rec.getMessage() for rec in offenders]}"
+    )
+
+
+def test_minion_manager_spawn_minions_keeps_task_reference(
+    minion_opts, connect_master_mock, tmp_path, caplog
+):
+    """
+    ``MinionManager._spawn_minions`` must keep a strong reference to each
+    ``_connect_minion`` Task.  Prior to the fix for #70748 the call-site
+    ``self.io_loop.create_task(self._connect_minion(minion))`` discarded
+    the return value, leaving the Task referenced only by asyncio's
+    module-level :class:`WeakSet`.  CPython's garbage collector could
+    then destroy the still-pending Task mid-retry and emit
+    ``Task was destroyed but it is pending!``.
+    """
+    minion_opts["sock_dir"] = str(tmp_path / "sock")
+    os.makedirs(minion_opts["sock_dir"])
+    minion_opts["acceptance_wait_time"] = 0
+    minion_opts["master"] = ["127.0.0.1"]
+    minion_opts["master_type"] = "failover"
+
+    mm = salt.minion.MinionManager(minion_opts)
+    try:
+        # The fix adds this attribute; its absence is the regression
+        # itself (the old create_task call-site did not keep refs).
+        assert hasattr(mm, "_background_tasks"), (
+            "MinionManager must expose _background_tasks so spawned "
+            "coroutines are strong-referenced; otherwise asyncio's "
+            "WeakSet is the only reference and the GC can destroy the "
+            "pending Task."
+        )
+        assert isinstance(mm._background_tasks, set)
+
+        before = set(mm._background_tasks)
+
+        # Patch _create_minion_object so we don't need a real minion
+        # (which would try to open a transport). Patch _connect_minion
+        # to a long-lived coroutine that stays pending so we can
+        # observe the task reference without racing completion.
+        connect_started = asyncio.Event()
+
+        async def _long_connect(_minion):
+            connect_started.set()
+            await asyncio.sleep(3600)
+
+        mm._create_minion_object = MagicMock(return_value=MagicMock())
+        mm._connect_minion = _long_connect
+
+        async def _run():
+            mm._spawn_minions(timeout=60)
+            # Yield so the newly-scheduled tasks actually start and reach
+            # their first ``await``, mirroring real-world bootstrap retry.
+            await connect_started.wait()
+
+        with caplog.at_level(logging.ERROR, logger="asyncio"):
+            mm.io_loop.run_until_complete(_run())
+
+        after = set(mm._background_tasks)
+        new_tasks = after - before
+        assert new_tasks, (
+            "_spawn_minions did not register any task in "
+            "_background_tasks -- a bare io_loop.create_task was used, "
+            "which lets the GC destroy pending Tasks (#70748)."
+        )
+        # Each new task must still be alive -- that's the crux of the
+        # regression: the old call-site dropped the ref, so by the time
+        # we looked here the task would already be gone.
+        for task in new_tasks:
+            assert not task.done(), (
+                "Spawned _connect_minion task completed unexpectedly; "
+                "the test expected a long-running pending task."
+            )
+
+        _assert_no_task_destroyed_warning(caplog.records)
+
+        # Clean up every registered background task so the loop doesn't
+        # tear down with pending tasks (which would itself emit the
+        # warning, purely as a test-cleanup artifact).
+        for task in list(mm._background_tasks):
+            task.cancel()
+        with contextlib.suppress(Exception):
+            mm.io_loop.run_until_complete(
+                asyncio.gather(*mm._background_tasks, return_exceptions=True)
+            )
+    finally:
+        mm.destroy()
+        if not mm.io_loop.is_closed():
+            mm.io_loop.close()
+
+
+def test_minion_manager_bind_keeps_publisher_task_reference(
+    minion_opts, tmp_path, caplog
+):
+    """
+    ``MinionManager._bind`` must route the event-publisher coroutine
+    through ``_spawn_background`` so a strong reference is retained
+    until the task completes.  See #70748.
+    """
+    minion_opts["sock_dir"] = str(tmp_path / "sock")
+    os.makedirs(minion_opts["sock_dir"])
+
+    mm = salt.minion.MinionManager(minion_opts)
+    try:
+        assert hasattr(mm, "_background_tasks")
+
+        # Record every call into _spawn_background so we can assert the
+        # publisher task went through it (and not a bare create_task).
+        orig_spawn = mm._spawn_background
+        spawn_calls = []
+
+        def _recording_spawn(coro):
+            spawn_calls.append(coro)
+            return orig_spawn(coro)
+
+        mm._spawn_background = _recording_spawn
+
+        with caplog.at_level(logging.ERROR, logger="asyncio"):
+            mm._bind()
+            # Let the publisher coroutine actually start.
+            mm.io_loop.run_until_complete(asyncio.sleep(0.2))
+
+        assert spawn_calls, (
+            "_bind did not go through _spawn_background -- the bare "
+            "io_loop.create_task regression is back (#70748)."
+        )
+        _assert_no_task_destroyed_warning(caplog.records)
+    finally:
+        # Drain every registered background task before closing the
+        # loop.  Without this, the long-running publisher and
+        # process-manager coroutines remain pending when the loop
+        # tears down and asyncio emits the very warning the fix is
+        # meant to prevent -- purely as a test-cleanup artifact.
+        for task in list(mm._background_tasks):
+            task.cancel()
+        with contextlib.suppress(Exception):
+            mm.io_loop.run_until_complete(
+                asyncio.gather(*mm._background_tasks, return_exceptions=True)
+            )
+        mm.destroy()
+        if not mm.io_loop.is_closed():
+            mm.io_loop.close()
+
+
+async def test_minion_process_process_queue_keeps_task_reference(
+    minion_opts, io_loop, caplog
+):
+    """
+    ``Minion.process_process_queue`` must route its fire-and-forget
+    coroutine through ``_spawn_background`` so the resulting Task is
+    strong-referenced.  See #70748.
+    """
+    minion = salt.minion.Minion(minion_opts)
+    # The _spawn_background helper lives on Minion; make sure the
+    # periodic callback actually uses it.
+    assert hasattr(minion, "_spawn_background")
+    before = set(getattr(minion, "_background_tasks", set()))
+
+    # Replace the heavy inner coroutine with a cooperative stub so
+    # we're testing the scheduling behaviour, not the queue semantics.
+    started = asyncio.Event()
+
+    async def _stub():
+        started.set()
+        await asyncio.sleep(0.05)
+
+    minion._process_process_queue_async = _stub
+
+    with caplog.at_level(logging.ERROR, logger="asyncio"):
+        minion.process_process_queue()
+        # Yield to let the scheduled stub actually execute.
+        await started.wait()
+        await asyncio.sleep(0.1)
+
+    after = set(getattr(minion, "_background_tasks", set()))
+    # It may have been added and already-discarded via add_done_callback
+    # -- but it must have been present at some point.  Easier to assert
+    # on: _background_tasks must exist and be a set (the fixing helper
+    # creates it lazily on first use).
+    assert hasattr(minion, "_background_tasks"), (
+        "Minion did not initialise _background_tasks after a "
+        "process_process_queue dispatch; the bare io_loop.create_task "
+        "regression is back (#70748)."
+    )
+    assert isinstance(minion._background_tasks, set)
+    assert started.is_set(), (
+        "The scheduled process-queue coroutine never ran; this is the "
+        "GC-mid-await symptom #70748 targets."
+    )
+    _assert_no_task_destroyed_warning(caplog.records)
+    # ``after`` may be empty (callback already discarded) or non-empty;
+    # either is consistent with the fix.  The actively-pending window
+    # is narrow enough that asserting it would flake.
+    assert after.issubset(set(minion._background_tasks))
+
+    # Drain any remaining background tasks (notably the process_manager
+    # coroutine spawned by ``Minion.__init__``) so they don't emit the
+    # very warning this test is guarding against purely as a
+    # test-cleanup artifact.
+    for task in list(minion._background_tasks):
+        task.cancel()
+    with contextlib.suppress(Exception):
+        await asyncio.gather(*minion._background_tasks, return_exceptions=True)
+    minion.destroy()

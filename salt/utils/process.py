@@ -602,13 +602,30 @@ class ProcessManager:
                 self._process_map[pid]["Process"].exitcode,
             )
         # don't block, the process is already dead
-        self._process_map[pid]["Process"].join(1)
+        old_process = self._process_map[pid]["Process"]
+        old_process.join(1)
 
         self.add_process(
             self._process_map[pid]["tgt"],
             self._process_map[pid]["args"],
             self._process_map[pid]["kwargs"],
         )
+
+        # Release the pipe fds held by the dead process's Popen object.
+        # Without this, every restart leaks the two ``parent_r``/``parent_w``
+        # pipe fds ``multiprocessing.popen_fork.Popen`` opens per fork.
+        # Long-running masters (which restart ``FileserverUpdate`` every
+        # ``fileserver_interval`` seconds and other subprocesses on their own
+        # cycles) accumulate these fds indefinitely -- roughly +2 fds per
+        # restart per subprocess -- until the master hits ``max_open_files``.
+        try:
+            old_process.close()
+        except (ValueError, AttributeError):
+            # ValueError: child had not fully finished (should not happen
+            #   because we just joined it, but be defensive).
+            # AttributeError: subclasses that override ``close`` or older
+            #   Python versions without ``Process.close`` (< 3.7).
+            pass
 
         del self._process_map[pid]
 
@@ -687,14 +704,11 @@ class ProcessManager:
                 # Check again after sleep - in async mode, exit if no processes
                 if not self._process_map:
                     break
-            # OSError is raised if a signal handler is called (SIGTERM) during os.wait
+            # OSError is raised if a signal handler is called (SIGTERM) during os.wait.
+            # Any OSError ends the loop. This includes EINTR from time.sleep() on
+            # Windows. IOError used to be handled separately to re-raise the other
+            # errors, but IOError is an alias of OSError in Python 3.
             except OSError:
-                break
-            except OSError as exc:  # pylint: disable=duplicate-except
-                # IOError with errno of EINTR (4) may be raised
-                # when using time.sleep() on Windows.
-                if exc.errno != errno.EINTR:
-                    raise
                 break
 
     def check_children(self):
@@ -977,6 +991,19 @@ class Process(multiprocessing.Process):
         logging_config = state["logging_config"]
         # This will invoke __init__ of the most derived class.
         self.__init__(*args, **kwargs)
+        # Re-seed the pickle-support attributes so a subsequent pickle
+        # (second-generation spawn via a child's own ``ProcessManager``) does
+        # not emit empty args/kwargs.  ``__new__`` set these from the original
+        # constructor call in the parent, but pickle's default unpickle flow
+        # calls ``cls.__new__(cls)`` with no args, leaving both attributes as
+        # empty tuples/dicts.  Without this re-seed, any grandchild's
+        # ``__setstate__`` calls ``self.__init__()`` with no positional args
+        # and crashes with ``TypeError: ... missing required positional
+        # arguments``.  Observed on Windows topology masters whose
+        # RequestServer sub-process spawns ``EventMonitor`` via its own
+        # ``ProcessManager`` (second-generation pickle).
+        self._args_for_getstate = copy.copy(args)
+        self._kwargs_for_getstate = copy.copy(kwargs)
         # Override self.__logging_config__ with what's in state
         self.__logging_config__ = logging_config
         for function, args, kwargs in state["after_fork_methods"]:
@@ -1236,16 +1263,18 @@ class SubprocessList:
         with self.lock:
             for proc in self.processes[:]:
                 try:
-                    proc.join(0.01)
+                    # is_alive() uses waitpid(WNOHANG) and never blocks.
+                    # join() without a timeout would block until the child
+                    # exits, so skip live children entirely -- a periodic
+                    # callback running every 200ms cannot afford to wait
+                    # on a live process.
+                    if proc.is_alive():
+                        continue
+                    proc.join()
                     if hasattr(proc, "exitcode"):
-                        # Only processes have exitcode and a close method, threads
-                        # do not.
-                        if proc.exitcode is None:
-                            continue
+                        # Only processes have exitcode and a close method,
+                        # threads do not.
                         proc.close()
-                    else:
-                        if proc.is_alive():
-                            continue
                 except (ValueError, OSError):
                     # Process may be closed or already cleaned up
                     pass

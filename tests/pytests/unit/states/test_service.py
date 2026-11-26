@@ -1,5 +1,5 @@
 """
-    :codeauthor: Gareth J. Greenaway <ggreenaway@vmware.com>
+    :codeauthor: Gareth J. Greenaway
 """
 
 import logging
@@ -11,6 +11,7 @@ import salt.modules.beacons as beaconmod
 import salt.states.beacon as beaconstate
 import salt.states.service as service
 import salt.utils.platform
+from salt.exceptions import CommandExecutionError, ServiceNotFoundError
 from salt.utils.event import SaltEvent
 from tests.support.mock import MagicMock, patch
 
@@ -24,9 +25,9 @@ def _check_systemctl():
         else:
             proc = subprocess.run(["systemctl"], capture_output=True, check=False)
             _check_systemctl.memo = (
-                b"Failed to get D-Bus connection: No such file or directory"
-                in proc.stderr
-                or b"Failed to connect to bus: No such file or directory" in proc.stderr
+                b"Failed to get D-Bus connection" in proc.stderr
+                or b"Failed to connect to bus:" in proc.stderr
+                or b"System has not been booted with systemd" in proc.stderr
             )
     return _check_systemctl.memo
 
@@ -497,6 +498,67 @@ def test_dead_with_missing_service():
             "result": True,
             "name": name,
         }
+
+
+@pytest.mark.parametrize("test_mode", [False, True])
+def test_dead_missing_service_passes(test_mode):
+    """
+    A service that is not present is not running, so dead must pass, also
+    with enable=False and in test mode.
+    """
+    name = "thisisnotarealservice"
+    with patch.dict(
+        service.__salt__, {"service.available": MagicMock(return_value=False)}
+    ), patch.dict(service.__opts__, {"test": test_mode}):
+        assert service.dead(name=name)["result"] is True
+        assert service.dead(name=name, enable=False)["result"] is True
+
+
+@pytest.mark.parametrize("test_mode", [False, True])
+def test_disabled_missing_service_passes(test_mode):
+    name = "thisisnotarealservice"
+    with patch.dict(
+        service.__salt__, {"service.available": MagicMock(return_value=False)}
+    ), patch.dict(service.__opts__, {"test": test_mode}):
+        ret = service.disabled(name)
+    assert ret["result"] is True
+    assert ret["changes"] == {}
+
+
+@pytest.mark.parametrize("func", ["dead", "disabled"])
+def test_missing_unit_lookup_error_passes(func):
+    """
+    A ServiceNotFoundError from the execution module means the service does
+    not exist, regardless of the (possibly localized) message.
+    """
+    name = "thisisnotarealservice"
+    exc = ServiceNotFoundError("Dienst nicht gefunden")
+    with patch.dict(
+        service.__salt__, {"service.available": MagicMock(side_effect=exc)}
+    ):
+        assert getattr(service, func)(name)["result"] is True
+
+
+@pytest.mark.parametrize("func", ["dead", "disabled"])
+def test_other_lookup_error_still_fails(func):
+    name = "thisisnotarealservice"
+    exc = CommandExecutionError(
+        f"Cannot run in offline mode. Failed to get information on unit '{name}'"
+    )
+    with patch.dict(
+        service.__salt__, {"service.available": MagicMock(side_effect=exc)}
+    ):
+        assert getattr(service, func)(name)["result"] is False
+
+
+@pytest.mark.parametrize("test_mode", [False, True])
+def test_enabled_missing_service_fails(test_mode):
+    name = "thisisnotarealservice"
+    with patch.dict(
+        service.__salt__, {"service.available": MagicMock(return_value=False)}
+    ), patch.dict(service.__opts__, {"test": test_mode}):
+        ret = service.enabled(name)
+    assert ret["result"] is (None if test_mode else False)
 
 
 def test_dead_in_offline_mode():

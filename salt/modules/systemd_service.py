@@ -28,7 +28,7 @@ import salt.utils.itertools
 import salt.utils.path
 import salt.utils.stringutils
 import salt.utils.systemd
-from salt.exceptions import CommandExecutionError
+from salt.exceptions import CommandExecutionError, ServiceNotFoundError
 
 log = logging.getLogger(__name__)
 
@@ -127,7 +127,11 @@ def _check_available(name):
             ret = match.group(1) != "not-found"
             break
     else:
-        raise CommandExecutionError("Failed to get information on unit '%s'" % name)
+        if _status["retcode"] == 4:
+            # Exit status 4 means "no such unit"; the output may be localized
+            # so it cannot be matched against the text above.
+            return False
+        raise ServiceNotFoundError("Failed to get information on unit '%s'" % name)
     return ret
 
 
@@ -285,14 +289,18 @@ def _runlevel():
     contextkey = "systemd._runlevel"
     if contextkey in __context__:
         return __context__[contextkey]
-    out = __salt__["cmd.run"](
-        salt.utils.path.which("runlevel"), python_shell=False, ignore_retcode=True
-    )
-    try:
-        ret = out.split()[1]
-    except IndexError:
-        # The runlevel is unknown, return the default
+    runlevel_bin = salt.utils.path.which("runlevel")
+    if runlevel_bin is None:
+        # No runlevel binary (e.g. Ubuntu 26.04 ships without sysvinit-utils),
+        # return the default
         ret = _default_runlevel()
+    else:
+        out = __salt__["cmd.run"](runlevel_bin, python_shell=False, ignore_retcode=True)
+        try:
+            ret = out.split()[1]
+        except IndexError:
+            # The runlevel is unknown, return the default
+            ret = _default_runlevel()
     __context__[contextkey] = ret
     return ret
 

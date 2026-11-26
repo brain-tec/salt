@@ -1,8 +1,8 @@
 name: Nightly Stress Test
+run-name: "Nightly Stress Test (branch: ${{ github.ref_name }})"
 
+# Branch schedulers on the default branch dispatch each target via --ref.
 on:
-  schedule:
-    - cron: '0 2 * * *' # 2 AM UTC
   workflow_dispatch:
     inputs:
       duration:
@@ -11,7 +11,10 @@ on:
         default: '0.5h'
         type: choice
         options:
-          - '10m'
+          # 20m is the minimum: analyze_stats.py ignores the first 10
+          # minutes (warm-up) and the last 2, and needs at least 8 more
+          # for a meaningful RSS/FD slope.
+          - '20m'
           - '0.5h'
           - '1h'
           - '1.5h'
@@ -33,13 +36,19 @@ on:
         required: false
         default: '5'
         type: string
+      metrics_exporter:
+        description: metrics.exporter used when enable_metrics is true
+        required: false
+        default: otlp-http
+        type: choice
+        options:
+          - otlp-http
+          - prometheus
 
 jobs:
   stress-test:
     runs-on: ubuntu-latest
-    # Repo-level opt-out. Set `SKIP_NIGHTLY_STRESS_TEST=true` on repos where
-    # this shouldn't run (e.g. saltstack/salt — the stress test's runner cost
-    # belongs on the salt-nightlies fork alongside the other nightlies infra).
+    # Repo-level opt-out, shared with the default branch's nightly dispatcher.
     if: vars.SKIP_NIGHTLY_STRESS_TEST != 'true'
     # ``contents: write`` lets the ``Publish panels to stress-snapshots
     # branch`` step push the rendered PNGs to an orphan branch so the
@@ -56,20 +65,19 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          key: ${{ runner.os }}-buildx-${{ github.ref_name }}-${{ github.sha }}
           restore-keys: |
-            ${{ runner.os }}-buildx-
+            ${{ runner.os }}-buildx-${{ github.ref_name }}-
 
       - name: Build and Start Environment
         run: |
           cd tests/monitoring
           # The prometheus container runs as ``nobody`` (uid 65534) and
           # writes its TSDB to ``/prometheus``.  Without pre-creating the
-          # bind-mount source with that ownership, Docker auto-creates
-          # it owned by root and prometheus fails to start with
-          # "permission denied" on /prometheus -- which then surfaces
-          # downstream as a bare ConnectionRefusedError when
-          # analyze_stats.py tries to query http://localhost:19090.
+          # bind-mount source with that ownership, Docker creates it
+          # owned by root and prometheus fails to start with "permission
+          # denied", which then shows up as a ConnectionRefusedError in
+          # analyze_stats.py.  (Same fix as on master.)
           mkdir -p prometheus_data
           sudo chown -R 65534:65534 prometheus_data
           docker compose build
@@ -89,6 +97,7 @@ jobs:
         env:
           ENABLE_METRICS: ${{ github.event.inputs.enable_metrics || 'false' }}
           WORKER_THREADS: ${{ github.event.inputs.worker_threads || '5' }}
+          METRICS_EXPORTER: ${{ github.event.inputs.metrics_exporter || 'otlp-http' }}
         run: |
           cd tests/monitoring
           need_restart=0
@@ -99,7 +108,13 @@ jobs:
             # re-runs are idempotent.  ``printf`` (not a heredoc) keeps
             # the YAML block-scalar indentation intact.
             if ! grep -q '^metrics:' master.conf; then
-              printf '\nmetrics:\n  enabled: true\n' >> master.conf
+              if [ "$METRICS_EXPORTER" = "prometheus" ]; then
+                # Listen on all interfaces so the prometheus container
+                # can scrape ``salt-master:9464``.
+                printf '\nmetrics:\n  enabled: true\n  exporter: prometheus\n  prometheus:\n    host: 0.0.0.0\n    port: 9464\n' >> master.conf
+              else
+                printf '\nmetrics:\n  enabled: true\n' >> master.conf
+              fi
               need_restart=1
             fi
           else
@@ -130,47 +145,15 @@ jobs:
           fi
 
       - name: Verify Connections
-        # The salt CLI returns exit 0 even when the master returns an
-        # error string (the legacy ``'str' object has no attribute
-        # 'pop'`` failure path surfaces this way), so we have to inspect
-        # the JSON output ourselves to fail the step.
         run: |
-          out=$(docker exec salt-master salt --out=json '*' test.ping)
-          echo "$out"
-          python3 - "$out" <<'PY'
-          import json, sys
-          payload = sys.argv[1].strip()
-          decoder = json.JSONDecoder()
-          idx = 0
-          bad = []
-          while idx < len(payload):
-              while idx < len(payload) and payload[idx].isspace():
-                  idx += 1
-              if idx >= len(payload):
-                  break
-              try:
-                  obj, end = decoder.raw_decode(payload, idx)
-              except ValueError as exc:
-                  bad.append(f"  non-JSON at offset {idx}: {exc}")
-                  break
-              idx = end
-              if isinstance(obj, dict):
-                  for mid, val in obj.items():
-                      if val is not True:
-                          bad.append(f"  minion {mid!r} returned {val!r}")
-              else:
-                  bad.append(f"  unexpected payload type: {type(obj).__name__}={obj!r}")
-          if bad:
-              print("Verify Connections failed:", file=sys.stderr)
-              for b in bad:
-                  print(b, file=sys.stderr)
-              sys.exit(1)
-          PY
+          docker exec salt-master salt '*' test.ping
 
       - name: Run Aggressive Stress Test
         run: |
           cd tests/monitoring
           chmod +x stress_test.sh stress_api.sh
+          # analyze_stats.py skips the first 10 minutes after this point
+          echo "STRESS_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
           # Run in background and wait for defined duration
           ./stress_test.sh &
           STRESS_PID=$!
@@ -186,7 +169,23 @@ jobs:
           pkill -P $STRESS_PID || true
           kill $STRESS_PID || true
 
+      - name: Show the master's own metrics
+        if: always() && github.event.inputs.enable_metrics == 'true' && github.event.inputs.metrics_exporter == 'prometheus'
+        run: |
+          mkdir -p artifacts
+          docker exec salt-master python3 -c \
+            "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:9464/metrics', timeout=10).read().decode())" \
+            > artifacts/salt-metrics.txt || true
+          # One file per process that has written metrics: the main
+          # process plus every MWorker (and any that were replaced).
+          docker exec salt-master sh -c 'ls -la /tmp/salt-metrics-*/' \
+            > artifacts/salt-metrics-dir.txt || true
+          grep -E '^salt_' artifacts/salt-metrics.txt | head -40 || true
+          cat artifacts/salt-metrics-dir.txt || true
+
       - name: Analyze Results
+        env:
+          EXPECT_SALT_PROMETHEUS_METRICS: ${{ (github.event.inputs.enable_metrics == 'true' && github.event.inputs.metrics_exporter == 'prometheus') && '1' || '0' }}
         run: |
           cd tests/monitoring
           # Give Prometheus a moment to finish scraping the final points
@@ -220,18 +219,14 @@ jobs:
           mkdir -p artifacts
           docker logs salt-master > artifacts/salt-master.log
           docker logs salt-minion-1 > artifacts/salt-minion-1.log
-          cp tests/monitoring/event_log.txt artifacts/ || true
-          # Always grab prometheus' own log so we can tell whether the
-          # connection refused was a startup issue (bind mount permissions
-          # etc.) vs. a runtime crash.
-          docker logs prometheus > artifacts/prometheus.log 2>&1 || true
+          cp monitoring/event_log.txt artifacts/ || true
 
       - name: Upload Artifacts
         id: upload-artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stress-test-results
+          name: stress-test-results-${{ github.ref_name }}
           path: |
             artifacts/
             prometheus-data.tar.gz
@@ -252,7 +247,7 @@ jobs:
           set -e
           REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
           BRANCH=stress-snapshots
-          RUN_DIR="runs/${{ github.run_id }}"
+          RUN_DIR="runs/${{ github.run_id }}/${{ github.ref_name }}"
 
           if git ls-remote --exit-code --heads "$REPO_URL" "$BRANCH" >/dev/null 2>&1; then
             git clone --depth=1 --branch="$BRANCH" "$REPO_URL" snaps
@@ -307,6 +302,6 @@ jobs:
           cd tests/monitoring
           PANELS_DIR="${GITHUB_WORKSPACE}/artifacts/panels" \
             python3 render_panels.py --summary --from-existing \
-              --artifact-name stress-test-results \
+              --artifact-name stress-test-results-${{ github.ref_name }} \
               --artifact-url "${{ steps.upload-artifacts.outputs.artifact-url }}" \
               --image-url-prefix "${{ steps.publish-snapshots.outputs.url-prefix }}"

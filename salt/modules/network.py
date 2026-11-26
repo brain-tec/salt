@@ -3,18 +3,18 @@ Module for gathering and managing network information
 """
 
 import concurrent.futures
-import datetime
-import hashlib
 import logging
 import os
 import random
 import re
+import secrets
 import socket
 import time
 
 import salt.utils.decorators.path
 import salt.utils.functools
 import salt.utils.network
+import salt.utils.path
 import salt.utils.platform
 import salt.utils.validate.net
 from salt._compat import ipaddress
@@ -471,6 +471,14 @@ def _netstat_route_linux():
     """
     ret = []
     cmd = "netstat -A inet -rn | tail -n+3"
+    which_netstat = salt.utils.path.which("netstat")
+    is_busybox = bool(
+        which_netstat
+        and salt.utils.path.islink(which_netstat)
+        and salt.utils.path.readlink(which_netstat).endswith("/busybox")
+    )
+    if is_busybox:
+        cmd = "netstat -rn | tail -n+3"
     out = __salt__["cmd.run"](cmd, python_shell=True)
     for line in out.splitlines():
         comps = line.split()
@@ -484,6 +492,9 @@ def _netstat_route_linux():
                 "interface": comps[7],
             }
         )
+    # No IPv6 in BusyBox'es netstat:
+    if is_busybox:
+        return ret
     cmd = "netstat -A inet6 -rn | tail -n+3"
     out = __salt__["cmd.run"](cmd, python_shell=True)
     for line in out.splitlines():
@@ -1087,12 +1098,27 @@ def dig(host):
     return __salt__["cmd.run"](cmd)
 
 
-def arp():
+def arp(expand=None):
     """
     Return the arp table from the minion
 
+    expand : None
+        If ``True``, return a list of neighbour entry dicts of the form
+        ``{"ip": ..., "mac": ..., "dev": ..., "state": ...}`` instead of the
+        legacy ``{mac: ip}`` mapping. The legacy mapping can only hold one
+        entry per MAC address, so any further IP addresses sharing that MAC
+        are silently dropped from it. Keys that ``arp -an`` does not report
+        on a given platform are set to ``None``.
+
     .. versionchanged:: 2015.8.0
         Added support for SunOS
+
+    .. versionchanged:: 3008.5
+        Added the ``expand`` argument. The list-of-entries shape it enables
+        will become the default return shape in salt 3011; until then,
+        calling this function without ``expand`` emits a
+        ``DeprecationWarning``. Unresolved (incomplete) entries are no
+        longer included in either shape.
 
     .. versionchanged:: 3009.0
         On Linux, fall back to ``ip neigh`` (iproute2) when the deprecated
@@ -1103,12 +1129,14 @@ def arp():
     .. code-block:: bash
 
         salt '*' network.arp
+        salt '*' network.arp expand=True
     """
+    expand = salt.utils.network.neigh_expand_warning("network.arp", expand)
     if __grains__["kernel"] == "Linux" and not __utils__["path.which"]("arp"):
         # net-tools may not be installed (deprecated since 2011 and absent by
         # default on modern distros); ip neigh is the iproute2 equivalent.
-        return ip_neighs()
-    ret = {}
+        return ip_neighs(expand=expand)
+    entries = []
     out = __salt__["cmd.run"]("arp -an")
     for line in out.splitlines():
         comps = line.split()
@@ -1117,19 +1145,53 @@ def arp():
         if __grains__["kernel"] == "SunOS":
             if ":" not in comps[-1]:
                 continue
-            ret[comps[-1]] = comps[1]
+            entries.append(
+                {
+                    "ip": comps[1],
+                    "mac": comps[-1],
+                    "dev": comps[0],
+                    "state": None,
+                }
+            )
         elif __grains__["kernel"] == "OpenBSD":
             if comps[0] == "Host" or comps[1] == "(incomplete)":
                 continue
-            ret[comps[1]] = comps[0]
+            entries.append(
+                {
+                    "ip": comps[0],
+                    "mac": comps[1],
+                    "dev": comps[2] if len(comps) > 2 else None,
+                    "state": None,
+                }
+            )
         elif __grains__["kernel"] == "AIX":
             if comps[0] in ("bucket", "There"):
                 continue
-            ret[comps[3]] = comps[1].strip("(").strip(")")
+            if comps[3] in ("<incomplete>", "(incomplete)"):
+                continue
+            entries.append(
+                {
+                    "ip": comps[1].strip("(").strip(")"),
+                    "mac": comps[3],
+                    "dev": None,
+                    "state": None,
+                }
+            )
         else:
-            ret[comps[3]] = comps[1].strip("(").strip(")")
+            if comps[3] in ("<incomplete>", "(incomplete)"):
+                continue
+            entries.append(
+                {
+                    "ip": comps[1].strip("(").strip(")"),
+                    "mac": comps[3],
+                    "dev": comps[comps.index("on") + 1] if "on" in comps[:-1] else None,
+                    "state": None,
+                }
+            )
 
-    return ret
+    if expand:
+        return entries
+    return salt.utils.network.neighs_flatten(entries)
 
 
 def interfaces():
@@ -1350,55 +1412,109 @@ def ip_addrs6(interface=None, include_loopback=False, cidr=None):
 ipaddrs6 = salt.utils.functools.alias_function(ip_addrs6, "ipaddrs6")
 
 
-def ip_neighs():
+def _parse_ip_neigh(family_char):
+    """
+    Parse ``ip neigh show`` output into a list of neighbour entry dicts for
+    the address family whose addresses contain ``family_char`` ("." for IPv4,
+    ":" for IPv6). Only resolved entries (those carrying a link-layer
+    address) are included, matching the historical behaviour.
+    """
+    entries = []
+    out = __salt__["cmd.run"]("ip neigh show")
+    for line in out.splitlines():
+        comps = line.split()
+        # Resolved entries always print as "<ip> dev <dev> lladdr <mac>
+        # [flags] <STATE>". Unresolved ones (FAILED/INCOMPLETE) carry no
+        # lladdr, and flag tokens such as "router" can still pad them to
+        # five fields, so the lladdr token is the only reliable gate.
+        if len(comps) < 5 or comps[3] != "lladdr":
+            continue
+        if family_char not in comps[0]:
+            continue
+        entries.append(
+            {
+                "ip": comps[0],
+                "mac": comps[4],
+                "dev": comps[2],
+                "state": comps[-1] if comps[-1] != comps[4] else None,
+            }
+        )
+
+    return entries
+
+
+def ip_neighs(expand=None):
     """
     Return the ip neighbour (arp) table from the minion for IPv4 addresses
 
+    expand : None
+        If ``True``, return a list of neighbour entry dicts of the form
+        ``{"ip": ..., "mac": ..., "dev": ..., "state": ...}`` instead of the
+        legacy ``{mac: ip}`` mapping. The legacy mapping can only hold one
+        entry per MAC address, so any further IP addresses sharing that MAC
+        are silently dropped from it.
+
     .. versionadded:: 3007.0
+
+    .. versionchanged:: 3008.5
+        Added the ``expand`` argument. The list-of-entries shape it enables
+        will become the default return shape in salt 3011; until then,
+        calling this function without ``expand`` emits a
+        ``DeprecationWarning``. Unresolved entries (those without a
+        link-layer address) are no longer included in either shape.
 
     CLI Example:
 
     .. code-block:: bash
 
         salt '*' network.ip_neighs
+        salt '*' network.ip_neighs expand=True
     """
-    ret = {}
-    out = __salt__["cmd.run"]("ip neigh show")
-    for line in out.splitlines():
-        comps = line.split()
-        if len(comps) < 5:
-            continue
-        if "." in comps[0]:
-            ret[comps[4]] = comps[0]
-
-    return ret
+    expand = salt.utils.network.neigh_expand_warning("network.ip_neighs", expand)
+    entries = _parse_ip_neigh(".")
+    if expand:
+        return entries
+    return salt.utils.network.neighs_flatten(entries)
 
 
 ipneighs = salt.utils.functools.alias_function(ip_neighs, "ipneighs")
 
 
-def ip_neighs6():
+def ip_neighs6(expand=None):
     """
     Return the ip neighbour (arp) table from the minion for IPv6 addresses
 
+    expand : None
+        If ``True``, return a list of neighbour entry dicts of the form
+        ``{"ip": ..., "mac": ..., "dev": ..., "state": ...}`` instead of the
+        legacy ``{mac: ip}`` mapping. The legacy mapping can only hold one
+        entry per MAC address, so any further IP addresses sharing that MAC
+        are silently dropped from it. Because IPv6 hosts normally hold at
+        least a link-local and a global address on the same MAC, the legacy
+        mapping loses entries for practically every neighbour; ``expand=True``
+        is strongly recommended.
+
     .. versionadded:: 3007.0
+
+    .. versionchanged:: 3008.5
+        Added the ``expand`` argument. The list-of-entries shape it enables
+        will become the default return shape in salt 3011; until then,
+        calling this function without ``expand`` emits a
+        ``DeprecationWarning``. Unresolved entries (those without a
+        link-layer address) are no longer included in either shape.
 
     CLI Example:
 
     .. code-block:: bash
 
         salt '*' network.ip_neighs6
+        salt '*' network.ip_neighs6 expand=True
     """
-    ret = {}
-    out = __salt__["cmd.run"]("ip neigh show")
-    for line in out.splitlines():
-        comps = line.split()
-        if len(comps) < 5:
-            continue
-        if ":" in comps[0]:
-            ret[comps[4]] = comps[0]
-
-    return ret
+    expand = salt.utils.network.neigh_expand_warning("network.ip_neighs6", expand)
+    entries = _parse_ip_neigh(":")
+    if expand:
+        return entries
+    return salt.utils.network.neighs_flatten(entries)
 
 
 ipneighs6 = salt.utils.functools.alias_function(ip_neighs6, "ipneighs6")
@@ -1658,9 +1774,7 @@ def connect(host, port=None, **kwargs):
         if proto == "udp":
             # Generate a random string of a
             # decent size to test UDP connection
-            md5h = hashlib.md5()
-            md5h.update(datetime.datetime.now().strftime("%s"))
-            msg = md5h.hexdigest()
+            msg = secrets.token_hex(16).encode()
             skt.sendto(msg, _address)
             recv, svr = skt.recvfrom(255)
             skt.close()
@@ -2140,6 +2254,37 @@ def ip_networks6(interface=None, include_loopback=False, verbose=False):
     )
 
 
+def _is_resolvable_address(addr):
+    """
+    Reverse DNS on link-local, site-local, or private addresses is almost
+    always a dead-end on a workstation or CI runner -- the resolver has no
+    zone that can answer, and each unresolvable address costs one full
+    resolver timeout (~30s on macOS).  macOS auto-assigns multiple
+    ``fec0::/10`` and ``fe80::/10`` addresses per interface, and
+    virtualized hosts like QEMU/UTM/VirtualBox hand out ``10.0.2.x`` NAT
+    addresses that the guest resolver never has a PTR record for.  Even
+    one such address can block ``salt-master`` startup for the full
+    resolver timeout.  Skip them -- callers that need PTR for private
+    space can run ``network.fqdns`` from a context that does have DNS for
+    it (not grain refresh at daemon startup).  See issue #62168.
+    """
+    try:
+        ip = ipaddress.ip_address(addr)
+    except (ValueError, TypeError):
+        return True
+    if ip.is_link_local:
+        return False
+    # ``ipaddress`` reports ``is_site_local`` only for IPv6 ``fec0::/10``
+    # (deprecated per RFC 3879 but macOS still hands them out).
+    if getattr(ip, "is_site_local", False):
+        return False
+    # ``is_private`` covers RFC1918 (10/8, 172.16/12, 192.168/16), ULA
+    # fc00::/7, and other non-globally-routable ranges.
+    if ip.is_private:
+        return False
+    return True
+
+
 def fqdns():
     """
     Return all known FQDNs for the system by enumerating all interfaces and
@@ -2156,6 +2301,7 @@ def fqdns():
 
     # Possible value for h_errno defined in netdb.h
     HOST_NOT_FOUND = 1
+    TRY_AGAIN = 2
     NO_DATA = 4
 
     fqdns = set()
@@ -2169,8 +2315,9 @@ def fqdns():
         try:
             return [socket.getfqdn(socket.gethostbyaddr(ip)[0])]
         except socket.herror as err:
-            if err.errno in (0, HOST_NOT_FOUND, NO_DATA):
-                # No FQDN for this IP address, so we don't need to know this all the time.
+            if err.errno in (0, HOST_NOT_FOUND, TRY_AGAIN, NO_DATA):
+                # No FQDN for this IP address (or the resolver is temporarily
+                # unavailable), so we don't need to know this all the time.
                 log.debug("Unable to resolve address %s: %s", ip, err)
             else:
                 log.error("Failed to resolve address %s: %s", ip, err)
@@ -2187,18 +2334,31 @@ def fqdns():
             include_loopback=False, interface_data=salt.utils.network._get_interfaces()
         )
     )
+    addresses = [a for a in addresses if _is_resolvable_address(a)]
 
     # Create a ThreadPool to process the underlying calls to
-    # 'socket.gethostbyaddr' in parallel.  This avoid blocking the execution
-    # when the "fqdn" is not defined for certains IP addresses, which was
-    # causing that "socket.timeout" was reached multiple times sequentially,
-    # blocking execution for several seconds.
+    # ``socket.gethostbyaddr`` in parallel.  This avoids blocking the
+    # execution when the "fqdn" is not defined for certain IP addresses,
+    # which was causing that "socket.timeout" was reached multiple times
+    # sequentially, blocking execution for several seconds.
+    #
+    # ``gethostbyaddr`` has no Python-level timeout and falls through to
+    # the OS resolver, which on macOS uses ~30s per unresponsive address.
+    # Even with the filter above, a single RFC1918-mangled address without
+    # a reverse DNS entry can still cost one timeout.  Bound the entire
+    # call to a short deadline so grain refresh (invoked during
+    # ``salt-master`` startup) can't stall for minutes on hosts whose
+    # resolver doesn't answer for interface addresses.  See #62168.
+    fqdn_lookup_timeout = 5
+    pool = concurrent.futures.ThreadPoolExecutor(8)
     try:
-        with concurrent.futures.ThreadPoolExecutor(8) as pool:
-            future_lookups = {
-                pool.submit(_lookup_fqdn, address): address for address in addresses
-            }
-            for future in concurrent.futures.as_completed(future_lookups):
+        future_lookups = {
+            pool.submit(_lookup_fqdn, address): address for address in addresses
+        }
+        try:
+            for future in concurrent.futures.as_completed(
+                future_lookups, timeout=fqdn_lookup_timeout
+            ):
                 try:
                     resolved_fqdn = future.result()
                     if resolved_fqdn:
@@ -2206,10 +2366,25 @@ def fqdns():
                 except Exception as exc:  # pylint: disable=broad-except
                     address = future_lookups[future]
                     log.error("Failed to resolve address %s: %s", address, exc)
+        except concurrent.futures.TimeoutError:
+            stuck = sorted(future_lookups[f] for f in future_lookups if not f.done())
+            log.warning(
+                "network.fqdns: reverse-DNS lookup exceeded %ss; abandoning "
+                "%d address(es) still resolving: %s",
+                fqdn_lookup_timeout,
+                len(stuck),
+                stuck,
+            )
     except Exception as exc:  # pylint: disable=broad-except
         log.error(
             "Exception while creating a ThreadPoolExecutor for resolving FQDNs: %s", exc
         )
+    finally:
+        # Underlying ``getaddrinfo`` / ``gethostbyaddr`` system calls can't
+        # be cancelled, so don't wait for stuck workers on return -- the
+        # OS resolver's own cache honors DNS record TTLs for subsequent
+        # calls.
+        pool.shutdown(wait=False, cancel_futures=True)
 
     elapsed = time.time() - start
     log.debug("Elapsed time getting FQDNs: %s seconds", elapsed)

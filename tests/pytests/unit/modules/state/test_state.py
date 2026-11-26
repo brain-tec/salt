@@ -14,6 +14,7 @@ import salt.loader
 import salt.loader.context
 import salt.modules.config as config
 import salt.modules.state as state
+import salt.payload
 import salt.state
 import salt.utils.args
 import salt.utils.files
@@ -592,8 +593,8 @@ def test_show_states_missing_sls():
     msg = ["No matching sls found for 'cloud' in evn 'base'"]
     chunks_mock = MagicMock(side_effect=[msg])
     mock = MagicMock(side_effect=["A", None])
-    with patch.object(state, "_check_queue", mock), patch(
-        "salt.state.HighState.compile_low_chunks", chunks_mock
+    with patch.object(state, "_check_queue", mock), patch.object(
+        MockState.HighState, "compile_low_chunks", chunks_mock
     ):
         assert state.show_low_sls("foo") == "A"
         assert state.show_states("foo") == [msg[0]]
@@ -1318,6 +1319,25 @@ def test__check_queue(queue, wait_called, ret_value):
             assert state.__context__["retcode"] == 1
 
 
+def test__check_queue_preserves_args_without_pub_arg(tmp_path):
+    """
+    A queued call with no __pub_arg (scheduler / salt-call) must keep the
+    caller's positional arguments such as ``mods``.
+    """
+    opts = {"cachedir": str(tmp_path), "state_queue": True}
+    with patch.dict(state.__opts__, opts), patch(
+        "salt.utils.state.state_queue_dir", return_value=str(tmp_path)
+    ), patch("salt.utils.state.acquire_queue_lock", MagicMock()), patch(
+        "salt.modules.state._prior_running_states", return_value=[{"jid": "1"}]
+    ):
+        ret = state.sls("target", queue=True, __pub_fun="state.sls", __pub_jid="2")
+    assert ret["queued"] is True
+    (queued,) = tmp_path.glob("queued_*.p")
+    with salt.utils.files.fopen(str(queued), "rb") as fp_:
+        payload = salt.payload.load(fp_)
+    assert payload["arg"] == [{"__kwarg__": True, "mods": "target"}]
+
+
 class TestCheckPriorRunningStates:
     """
     Test the check_prior_running_states function race condition fixes.
@@ -1438,3 +1458,56 @@ class TestCheckPriorRunningStates:
         # Only the strictly older queued placeholder should block.
         assert len(result) == 1
         assert result[0]["jid"] == "20260718005609000000"
+
+    def test_check_prior_running_states_waiting_job_blocks_only_younger(self, tmp_path):
+        """
+        Regression test for issue #70580.
+
+        A running state.* job that is itself waiting in ``_wait()`` (the
+        ``queue=<int>`` path) has a PID, but also a queue flag file named
+        after its JID. It must block only jobs with a higher JID, otherwise
+        two waiting jobs block each other forever once a third run exists.
+        """
+        opts = {"cachedir": str(tmp_path)}
+        queue_dir = salt.utils.state.state_queue_dir(opts)
+        os.makedirs(queue_dir)
+        older, newer = "20260718005609000000", "20260718005611000000"
+        for jid in (older, newer):
+            with salt.utils.files.fopen(os.path.join(queue_dir, jid), "w") as fp_:
+                fp_.write("12345")
+        active_jobs = [
+            {"jid": older, "fun": "state.apply", "pid": 111},
+            {"jid": newer, "fun": "state.apply", "pid": 222},
+        ]
+
+        # The oldest waiting job is not blocked by the younger one...
+        result = salt.utils.state.check_prior_running_states(opts, older, active_jobs)
+        assert result == []
+
+        # ...while the younger one still waits on the older one.
+        result = salt.utils.state.check_prior_running_states(opts, newer, active_jobs)
+        assert [job["jid"] for job in result] == [older]
+
+    def test_check_prior_running_states_running_job_without_flag_blocks(self, tmp_path):
+        """
+        A running job with no queue flag is actually executing and must
+        still block regardless of JID order (issue #69825).
+        """
+        opts = {"cachedir": str(tmp_path)}
+        active_jobs = [{"jid": "20260718005611000000", "fun": "state.apply", "pid": 7}]
+        result = salt.utils.state.check_prior_running_states(
+            opts, "20260718005610000000", active_jobs
+        )
+        assert len(result) == 1
+
+
+@pytest.mark.usefixtures("mocked_tcp_pub_client")
+@pytest.mark.parametrize("exc", [KeyboardInterrupt, SystemExit])
+def test_event_exits_cleanly_on_interrupt(exc):
+    """
+    state.event must stop quietly, without a traceback, when interrupted
+    with Ctrl-c (KeyboardInterrupt, or SystemExit from the CLI signal handler)
+    """
+    with patch.object(SaltEvent, "get_event", side_effect=exc):
+        with patch.object(SaltEvent, "connect_pub", return_value=True):
+            assert state.event(count=-1, quiet=True) is None

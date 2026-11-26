@@ -27,6 +27,10 @@ on:
         type: boolean
         default: false
         description: Sign DEB Packages
+      sign-macos-packages:
+        type: boolean
+        default: false
+        description: Sign MacOS Packages
       skip-salt-test-suite:
         type: boolean
         default: false
@@ -387,7 +391,7 @@ jobs:
         if: ${{ startsWith(github.event.ref, 'refs/tags') == false }}
         run: |
           git config --global user.name "Salt Project Packaging"
-          git config --global user.email saltproject-packaging@vmware.com
+          git config --global user.email saltproject.pdl@broadcom.com
 
       - name: Setup Pre-Commit
         if: ${{ startsWith(github.event.ref, 'refs/tags') == false }}
@@ -490,8 +494,8 @@ jobs:
     with:
       cache-seed: ${{ needs.prepare-workflow.outputs.cache-seed }}
       salt-version: "${{ needs.prepare-workflow.outputs.salt-version }}"
-      relenv-version: "0.22.25"
-      python-version: "3.14.7"
+      relenv-version: "0.22.32"
+      python-version: "3.14.10"
       ci-python-version: "3.14"
       matrix: ${{ toJSON(fromJSON(needs.prepare-workflow.outputs.config)['build-matrix']) }}
       linux_arm_runner: ${{ fromJSON(needs.prepare-workflow.outputs.config)['linux_arm_runner'] }}
@@ -508,14 +512,14 @@ jobs:
     with:
       salt-version: "${{ needs.prepare-workflow.outputs.salt-version }}"
       cache-prefix: ${{ needs.prepare-workflow.outputs.cache-seed }}
-      relenv-version: "0.22.25"
-      python-version: "3.14.7"
+      relenv-version: "0.22.32"
+      python-version: "3.14.10"
       ci-python-version: "3.14"
       source: "onedir"
       matrix: ${{ toJSON(fromJSON(needs.prepare-workflow.outputs.config)['build-matrix']) }}
       linux_arm_runner: ${{ fromJSON(needs.prepare-workflow.outputs.config)['linux_arm_runner'] }}
       environment: staging
-      sign-macos-packages: true
+      sign-macos-packages: ${{ inputs.sign-macos-packages }}
       sign-rpm-packages: ${{ inputs.sign-rpm-packages }}
       sign-deb-packages: ${{ inputs.sign-deb-packages }}
       sign-windows-packages: ${{ inputs.sign-windows-packages }}
@@ -531,14 +535,14 @@ jobs:
     with:
       salt-version: "${{ needs.prepare-workflow.outputs.salt-version }}"
       cache-prefix: ${{ needs.prepare-workflow.outputs.cache-seed }}
-      relenv-version: "0.22.25"
-      python-version: "3.14.7"
+      relenv-version: "0.22.32"
+      python-version: "3.14.10"
       ci-python-version: "3.14"
       source: "src"
       matrix: ${{ toJSON(fromJSON(needs.prepare-workflow.outputs.config)['build-matrix']) }}
       linux_arm_runner: ${{ fromJSON(needs.prepare-workflow.outputs.config)['linux_arm_runner'] }}
       environment: staging
-      sign-macos-packages: true
+      sign-macos-packages: ${{ inputs.sign-macos-packages }}
       sign-rpm-packages: ${{ inputs.sign-rpm-packages }}
       sign-deb-packages: ${{ inputs.sign-deb-packages }}
       sign-windows-packages: ${{ inputs.sign-windows-packages }}
@@ -552,10 +556,10 @@ jobs:
     with:
       nox-session: ci-test-onedir
       nox-version: 2022.8.7
-      python-version: "3.14.7"
+      python-version: "3.14.10"
       ci-python-version: "3.14"
       salt-version: "${{ needs.prepare-workflow.outputs.salt-version }}"
-      cache-prefix: ${{ needs.prepare-workflow.outputs.cache-seed }}|3.14.7
+      cache-prefix: ${{ needs.prepare-workflow.outputs.cache-seed }}|3.14.10
       nox-archive-hash: "${{ needs.prepare-workflow.outputs.nox-archive-hash }}"
       matrix: ${{ toJSON(fromJSON(needs.prepare-workflow.outputs.config)['build-matrix']) }}
       linux_arm_runner: ${{ fromJSON(needs.prepare-workflow.outputs.config)['linux_arm_runner'] }}
@@ -573,7 +577,7 @@ jobs:
       salt-version: "${{ needs.prepare-workflow.outputs.salt-version }}"
       nox-version: 2022.8.7
       ci-python-version: "3.14"
-      cache-prefix: ${{ needs.prepare-workflow.outputs.cache-seed }}|3.14.7
+      cache-prefix: ${{ needs.prepare-workflow.outputs.cache-seed }}|3.14.10
       skip-code-coverage: true
       testing-releases: ${{ needs.prepare-workflow.outputs.testing-releases }}
       matrix: ${{ toJSON(fromJSON(needs.prepare-workflow.outputs.config)['pkg-test-matrix']) }}
@@ -592,7 +596,7 @@ jobs:
       ci-python-version: "3.14"
       testrun: ${{ toJSON(fromJSON(needs.prepare-workflow.outputs.config)['testrun']) }}
       salt-version: "${{ needs.prepare-workflow.outputs.salt-version }}"
-      cache-prefix: ${{ needs.prepare-workflow.outputs.cache-seed }}|3.14.7
+      cache-prefix: ${{ needs.prepare-workflow.outputs.cache-seed }}|3.14.10
       skip-code-coverage: true
       workflow-slug: staging
       default-timeout: 180

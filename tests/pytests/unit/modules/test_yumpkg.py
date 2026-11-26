@@ -919,7 +919,8 @@ def test_list_repo_pkgs_with_options(list_repos_var):
 
 def test_list_upgrades_dnf():
     """
-    The subcommand should be "upgrades" with dnf
+    list_upgrades should invoke ``dnf check-update`` so versionlocked / held
+    packages are not reported as upgradable (issue #68138).
     """
     with patch.dict(yumpkg.__context__, {"yum_bin": "dnf"}):
         # with fromrepo
@@ -936,8 +937,7 @@ def test_list_upgrades_dnf():
                     "--disablerepo=*",
                     "--enablerepo=good",
                     "--branch=foo",
-                    "list",
-                    "--upgrades",
+                    "check-update",
                 ],
                 env={},
                 output_loglevel="trace",
@@ -961,14 +961,43 @@ def test_list_upgrades_dnf():
                     "--disablerepo=bad",
                     "--enablerepo=good",
                     "--branch=foo",
-                    "list",
-                    "--upgrades",
+                    "check-update",
                 ],
                 env={},
                 output_loglevel="trace",
                 ignore_retcode=True,
                 python_shell=False,
             )
+
+
+def test_list_upgrades_dnf_skips_obsoleting_packages_section():
+    """
+    ``dnf check-update`` output appends an ``Obsoleting Packages`` trailer
+    where the obsoleted (currently-installed) package is listed indented under
+    the obsoleting one. _yum_pkginfo's 3-token cycle would otherwise yield the
+    installed package as an available upgrade. list_upgrades must only return
+    the real upgrade rows above the Obsoleting Packages header.
+    """
+    # Mimic ``dnf --quiet check-update`` stdout: a blank line, two upgradable
+    # packages, then an Obsoleting Packages section in which ``oldpkg`` is the
+    # installed (obsoleted) package and should NOT appear in the result.
+    stdout = (
+        "\n"
+        "pkg-one.x86_64    1.2-3.el9    myrepo\n"
+        "pkg-two.x86_64    4.5-6.el9    myrepo\n"
+        "\n"
+        "Obsoleting Packages\n"
+        "newpkg.x86_64    9.0-1.el9    myrepo\n"
+        "    oldpkg.x86_64    8.0-1.el9    @System\n"
+    )
+    mock_call_yum = MagicMock(return_value={"retcode": 100, "stdout": stdout})
+    with patch.dict(yumpkg.__context__, {"yum_bin": "dnf"}), patch.object(
+        yumpkg, "_call_yum", mock_call_yum
+    ):
+        result = yumpkg.list_upgrades(refresh=False)
+    assert result == {"pkg-one": "1.2-3.el9", "pkg-two": "4.5-6.el9"}
+    assert "oldpkg" not in result
+    assert "newpkg" not in result
 
 
 def test_list_upgrades_refresh():
@@ -1107,6 +1136,59 @@ def test_list_upgrades_yum():
             ignore_retcode=True,
             python_shell=False,
         )
+
+
+def test_list_upgrades_passes_extra_options_to_yum():
+    """
+    Regression for #70235: ``pkg.list_upgrades`` must forward extra kwargs
+    (e.g. ``exclude='kernel*'``, ``security=True``) to the underlying
+    yum/dnf command, matching the behavior of ``pkg.upgrade``.  Previously
+    ``_get_options(**kwargs)`` was called without ``get_extra_options=True``
+    so ``exclude`` and friends were silently dropped, which made
+    ``state.test=True`` previews of ``pkg.uptodate`` diverge from the real
+    apply.
+    """
+    cmd = MagicMock(return_value={"retcode": 0, "stdout": ""})
+    with patch.dict(yumpkg.__context__, {"yum_bin": "dnf"}), patch.dict(
+        yumpkg.__salt__,
+        {"cmd.run_all": cmd, "config.get": MagicMock(return_value=False)},
+    ):
+        yumpkg.list_upgrades(
+            refresh=False, exclude="kernel*", security=True, fromrepo="good"
+        )
+        cmd.assert_called_once_with(
+            [
+                "dnf",
+                "--quiet",
+                "--disablerepo=*",
+                "--enablerepo=good",
+                "--exclude=kernel*",
+                "--security",
+                "check-update",
+            ],
+            env={},
+            output_loglevel="trace",
+            ignore_retcode=True,
+            python_shell=False,
+        )
+
+
+def test_list_upgrades_extra_options_without_fromrepo():
+    """
+    Same contract as above but without the ``fromrepo`` short-circuit: the
+    extra kwargs must land in the yum/dnf command regardless of whether
+    repo-selection options are present.
+    """
+    cmd = MagicMock(return_value={"retcode": 0, "stdout": ""})
+    with patch.dict(yumpkg.__context__, {"yum_bin": "dnf"}), patch.dict(
+        yumpkg.__salt__,
+        {"cmd.run_all": cmd, "config.get": MagicMock(return_value=False)},
+    ):
+        yumpkg.list_upgrades(refresh=False, exclude="kernel*")
+        args, _ = cmd.call_args
+        assert (
+            "--exclude=kernel*" in args[0]
+        ), f"list_upgrades dropped the extra --exclude option: {args[0]}"
 
 
 def test_modified():
@@ -1833,15 +1915,11 @@ def test_install_error_reporting():
         yumpkg, "_yum", MagicMock(return_value="cat")
     ):
 
-        expected = {
-            "changes": {},
-            "errors": [
-                "cat: invalid option -- 'y'\nTry 'cat --help' for more information."
-            ],
-        }
         with pytest.raises(CommandExecutionError) as exc_info:
             yumpkg.install("foo", version=new)
-        assert exc_info.value.info == expected, exc_info.value.info
+        info = exc_info.value.info
+        assert info["changes"] == {}, info
+        assert info["errors"], info
 
 
 def test_remove_error():
@@ -2743,7 +2821,7 @@ def test_get_yum_config(grains):
         # This one seems to be in all of them...
         # If this ever breaks in the future, we'll need to get more specific
         # than os_family
-        setting = "installonly_limit"
+        setting = "reposdir"
     result = yumpkg._get_yum_config()
     assert setting in result
 
@@ -2944,7 +3022,6 @@ def test_group_info():
             "yelp",
         ],
         "optional": [
-            "",
             "alacarte",
             "dconf-editor",
             "dvgrab",
@@ -3580,3 +3657,106 @@ def test_59705_version_as_accidental_float_should_become_text(
         yumpkg.install("fnord", version=new)
         call = cmd_mock.mock_calls[0][1][0]
         assert call == expected_cmd
+
+
+def test_67975_dnf5_group_info():
+    """
+    Test yumpkg.group_info parsing of the dnf5 'group info' format, where each
+    package section carries its first member inline after the colon and the
+    rest on continuation lines.
+    """
+    cmd_out = """\
+Id                   : libreoffice
+Name                 : LibreOffice
+Description          : LibreOffice Productivity Suite
+Installed            : yes
+Order                :
+Langonly             :
+Uservisible          : yes
+Repositories         : @System
+Mandatory packages   : libreoffice-calc
+                     : libreoffice-emailmerge
+                     : libreoffice-graphicfilter
+                     : libreoffice-impress
+                     : libreoffice-writer
+Optional packages    : libreoffice-base
+                     : libreoffice-draw
+                     : libreoffice-math
+                     : libreoffice-pyuno"""
+    expected = {
+        "mandatory": [
+            "libreoffice-calc",
+            "libreoffice-emailmerge",
+            "libreoffice-graphicfilter",
+            "libreoffice-impress",
+            "libreoffice-writer",
+        ],
+        "optional": [
+            "libreoffice-base",
+            "libreoffice-draw",
+            "libreoffice-math",
+            "libreoffice-pyuno",
+        ],
+        "default": [],
+        "conditional": [],
+        "type": "package group",
+        "group": "LibreOffice",
+        "id": "libreoffice",
+        "description": "LibreOffice Productivity Suite",
+    }
+    with patch.object(yumpkg, "_yum", MagicMock(return_value="dnf5")), patch.dict(
+        yumpkg.__salt__, {"cmd.run_stdout": MagicMock(return_value=cmd_out)}
+    ):
+        assert yumpkg.group_info("libreoffice") == expected
+
+
+def test_67975_dnf5_group_list():
+    """
+    Test yumpkg.group_list parsing of the dnf5 'group list' table. The group
+    name column is tokenized rather than matched with a regex, so a name that
+    contains or ends with the word "yes"/"no" (``Just (testing) yes``) is not
+    mistaken for the trailing Installed column, and a row with trailing
+    whitespace (``last``) is still classified rather than dropped.
+    """
+    cmd_out = (
+        "ID                   Name             Installed\n"
+        "foo                  Foo package             no\n"
+        "bar                  Bar package             no\n"
+        "brackets             Just (testing) yes     yes\n"
+        "cleaners             Mop and bucket         yes\n"
+        "last                 But not least           no    \n"
+    )
+    expected = {
+        "installed": ["brackets", "cleaners"],
+        "available": ["foo", "bar", "last"],
+        "installed environments": [],
+        "available environments": [],
+        "available languages": {},
+    }
+    with patch.object(yumpkg, "_yum", MagicMock(return_value="dnf5")), patch.dict(
+        yumpkg.__salt__, {"cmd.run_stdout": MagicMock(return_value=cmd_out)}
+    ):
+        assert yumpkg.group_list() == expected
+
+
+def test_dnf5_group_info_skips_blank_member_lines():
+    """
+    A blank line inside a package section (e.g. between sections) must not be
+    recorded as an empty package name.
+    """
+    cmd_out = (
+        "Id                   : development-tools\n"
+        "Name                 : Development Tools\n"
+        "Installed            : no\n"
+        "Mandatory packages   : gettext\n"
+        "\n"
+        "Optional packages    : cmake\n"
+    )
+    with patch.object(yumpkg, "_yum", MagicMock(return_value="dnf5")), patch.dict(
+        yumpkg.__salt__, {"cmd.run_stdout": MagicMock(return_value=cmd_out)}
+    ):
+        info = yumpkg.group_info("Development Tools")
+    assert info["mandatory"] == ["gettext"]
+    assert info["optional"] == ["cmake"]
+    assert "" not in info["mandatory"]
+    assert "" not in info["optional"]

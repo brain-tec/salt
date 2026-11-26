@@ -300,6 +300,7 @@ def _check_if_installed(
     index_url,
     extra_index_url,
     pip_list=False,
+    proxy=None,
     **kwargs,
 ):
     """
@@ -364,6 +365,7 @@ def _check_if_installed(
                 cwd=cwd,
                 index_url=index_url,
                 extra_index_url=extra_index_url,
+                proxy=proxy,
             )
             desired_version = ""
             if any(version_spec) and available_versions:
@@ -768,9 +770,14 @@ def installed(
 
     .. _`virtualenv`: http://www.virtualenv.org/en/latest/
 
-    If you are using onedir packages and you need to install python packages into
-    the system python environment, you must provide the pip_bin or
-    bin_env to the pip state module.
+    Onedir packages bundle their own Python environment via relenv. Because
+    of this, omitting ``pip_bin``/``bin_env`` installs into the onedir's
+    isolated extras directory via ``salt-pip``, not the system's Python --
+    installed packages will be invisible to anything running outside of
+    Salt's environment. If you need to install python packages into the
+    system python environment instead, you must provide the pip_bin or
+    bin_env to the pip state module (see :ref:`salt-pip-onedir` for more
+    details).
 
 
     .. code-block:: yaml
@@ -951,6 +958,7 @@ def installed(
                     index_url,
                     extra_index_url,
                     pip_list,
+                    proxy=proxy,
                     **kwargs,
                 )
                 # If _check_if_installed result is None, something went wrong with
@@ -1139,7 +1147,16 @@ def installed(
                     else:
                         if (
                             prefix in pipsearch
-                            and prefix not in already_installed_packages
+                            # pip can report the old version as satisfied before
+                            # upgrading it. Prefer the observed version change.
+                            and (
+                                prefix not in already_installed_packages
+                                or (
+                                    pip_list
+                                    and prefix in pip_list
+                                    and pip_list[prefix] != pipsearch[prefix]
+                                )
+                            )
                         ):
                             ver = pipsearch[prefix]
                             ret["changes"][f"{prefix}=={ver}"] = "Installed"

@@ -192,23 +192,25 @@ def test_watch(etcd_client_mock, instance):
             "key": "/salt",
         }
         assert etcd_mod.watch("/salt") == instance.watch.return_value
-        instance.watch.assert_called_with("/salt", recurse=False, timeout=0, index=None)
+        instance.watch.assert_called_with(
+            "/salt", recurse=False, timeout=0, start_revision=None
+        )
 
         instance.watch.return_value["dir"] = True
         assert (
-            etcd_mod.watch("/some-dir", recurse=True, timeout=5, index=10)
+            etcd_mod.watch("/some-dir", recurse=True, timeout=5, start_revision=10)
             == instance.watch.return_value
         )
         instance.watch.assert_called_with(
-            "/some-dir", recurse=True, timeout=5, index=10
+            "/some-dir", recurse=True, timeout=5, start_revision=10
         )
 
         assert (
-            etcd_mod.watch("/some-dir", True, None, 5, 10)
+            etcd_mod.watch("/some-dir", True, None, 5, start_revision=10)
             == instance.watch.return_value
         )
         instance.watch.assert_called_with(
-            "/some-dir", recurse=True, timeout=5, index=10
+            "/some-dir", recurse=True, timeout=5, start_revision=10
         )
 
 
@@ -218,20 +220,16 @@ def test_auth(auth_opts):
     when both are present in opts.
     """
     with patch("salt.utils.etcd_util.HAS_ETCD_V3", True), patch(
-        "etcd3.Client"
-    ) as mock_etcd3_client:
-        mock_client_instance = MagicMock()
-        mock_etcd3_client.return_value = mock_client_instance
-
+        "salt.utils.etcd_util._client_class"
+    ) as client_class:
         client = etcd_util.EtcdClientV3(auth_opts, has_etcd_opts=True)
 
         assert client.xargs.get("username") == "root"
         assert client.xargs.get("password") == "Passw0rd"
-        # Credentials must be forwarded to the underlying etcd3.Client call
-        mock_etcd3_client.assert_called_once_with(
+        # Credentials must be forwarded to the etcd3gw client
+        client_class.return_value.assert_called_once_with(
             host="127.0.0.1",
             port=2379,
             username="root",
             password="Passw0rd",
-            verify=None,  # no TLS configured
         )

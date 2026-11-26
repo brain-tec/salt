@@ -1,5 +1,6 @@
 import asyncio
 import ctypes
+import logging
 import multiprocessing
 import pathlib
 import time
@@ -1036,6 +1037,66 @@ async def test_publish_payload_cluster_runner_shed_unowned_all_decodes(master_op
     channel.transport.publish_payload.assert_not_called()
 
 
+async def test_run_shed_unowned_all_fans_out_cluster_peer_shed_request(master_opts):
+    """
+    The published ring documentation says ``cluster.shed_unowned_all``
+    fans out to every peer via a ``cluster/peer/shed-request`` event
+    carrying the runner's parameters, cluster_aes-encrypted.  Pin:
+
+    1. Every pusher receives a ``publish`` call.
+    2. Each event's outer tag is exactly
+       ``cluster/peer/shed-request``.
+    3. The envelope round-trips through the ``cluster_aes`` crypticle
+       and restores the original request payload — a regression that
+       dropped the encryption (or truncated the payload) trips here.
+    """
+    from tests.support.mock import AsyncMock, MagicMock
+    from tests.support.mock import patch as _patch
+
+    channel = _pub_channel(
+        master_opts,
+        pushers=[MagicMock(pull_host="peer-a"), MagicMock(pull_host="peer-b")],
+    )
+    for pusher in channel.pushers:
+        pusher.publish = AsyncMock(return_value=None)
+
+    # Secrets stub for the Crypticle.  SMaster.secrets["cluster_aes"]
+    # is the shared cluster AES key; a 32-byte token is enough to
+    # satisfy ``Crypticle.generate_key_string`` consumers.
+    secrets = {
+        "cluster_aes": {
+            "secret": MagicMock(value=salt.crypt.Crypticle.generate_key_string())
+        }
+    }
+    payload = {
+        "ring_id": "jobs",
+        "banks": ["jobs/loads", "jobs/minions"],
+        "subbank_template": "jobs/returns/{key}",
+        "driver": None,
+        "dry_run": False,
+    }
+
+    with _patch.object(server.salt.master.SMaster, "secrets", secrets):
+        await channel._run_shed_unowned_all(payload)
+
+    for pusher in channel.pushers:
+        pusher.publish.assert_called_once()
+    # Inspect the envelope on one of the publishes.
+    envelope = channel.pushers[0].publish.call_args.args[0]
+    tag, body = salt.utils.event.SaltEvent.unpack(envelope)
+    assert tag == "cluster/peer/shed-request", (
+        "fan-out envelope tag drifted from the documented "
+        f"'cluster/peer/shed-request': got {tag!r}"
+    )
+    # Round-trip the encrypted body through a fresh Crypticle sharing
+    # the same cluster_aes secret — proves the envelope stayed
+    # encrypted and the full payload survived.
+    crypticle = salt.crypt.Crypticle(
+        master_opts, secrets["cluster_aes"]["secret"].value
+    )
+    assert crypticle.loads(body) == payload
+
+
 async def test_publish_payload_cluster_runner_delegate_write_decodes(master_opts):
     """
     ``cluster/runner/delegate_write`` decodes and dispatches
@@ -1217,6 +1278,70 @@ def test_publish_daemon_sets_eventpublisher_process_title():
             channel._publish_daemon()
 
     fake_setproctitle.setproctitle.assert_called_once_with("EventPublisher")
+
+
+def test_master_pub_server_channel_publish_daemon_configures_tracing():
+    """
+    Regression: ``MasterPubServerChannel._publish_daemon`` must call
+    ``salt.utils.tracing.configure(self.opts)`` on entry so the daemon
+    process initialises OpenTelemetry under its own pid.
+
+    Without this call, every ``salt.utils.tracing.inject`` /
+    ``start_span`` invocation in the publish daemon (including the
+    cross-cluster traceparent injection in ``PeerMasterLink.send_publish``
+    and the local ``salt.pub.send`` span) short-circuits silently because
+    ``tracing.is_enabled()`` returns False in a process that never ran
+    ``configure``.  Peer-cluster masters then produce orphaned spans with
+    no linkage back to the originating publish trace.
+    """
+    import salt.utils.tracing
+    from tests.support.mock import MagicMock, patch
+
+    channel = server.MasterPubServerChannel.__new__(server.MasterPubServerChannel)
+    channel.opts = {"event_publisher_niceness": 0}
+    channel.transport = MagicMock()
+
+    # Short-circuit the daemon body after ``configure`` by making the next
+    # line (``IOLoop.current``) raise.
+    with patch.object(
+        salt.utils.tracing, "configure", MagicMock()
+    ) as fake_configure, patch(
+        "tornado.ioloop.IOLoop.current", side_effect=StopIteration
+    ):
+        with pytest.raises(StopIteration):
+            channel._publish_daemon()
+
+    fake_configure.assert_called_once_with(channel.opts)
+
+
+def test_pub_server_channel_publish_daemon_configures_tracing():
+    """
+    Companion to
+    :func:`test_master_pub_server_channel_publish_daemon_configures_tracing`:
+    ``PubServerChannel._publish_daemon`` (the base pub daemon used by
+    non-cluster masters) must also call
+    ``salt.utils.tracing.configure(self.opts)`` so the ``salt.pub.send``
+    span and any future daemon-side tracing produce real spans.
+    """
+    import salt.utils.tracing
+    from tests.support.mock import MagicMock, patch
+
+    channel = server.PubServerChannel.__new__(server.PubServerChannel)
+    # ``pub_server_niceness`` gates an ``os.nice`` call; keep it falsy.
+    channel.opts = {"pub_server_niceness": 0}
+    channel.transport = MagicMock()
+    # ``publish_daemon`` is called at the end; make it raise so the test
+    # observes the configure() call before any transport setup.
+    channel.transport.publish_daemon.side_effect = StopIteration
+    channel.master_key = None
+
+    with patch.object(
+        salt.utils.tracing, "configure", MagicMock()
+    ) as fake_configure, patch("salt.crypt.MasterKeys", MagicMock(return_value=None)):
+        with pytest.raises(StopIteration):
+            channel._publish_daemon()
+
+    fake_configure.assert_called_once_with(channel.opts)
 
 
 def test_pool_routing_channel_caches_auto_key_on_init(tmp_path):
@@ -1434,4 +1559,723 @@ async def test_join_reply_refreshes_master_keys_cache_70090(tmp_path, key_data):
         "Fix regression: master_key.key must also be rebound to the new "
         "cluster_key (mirrors the ``self.key = self.cluster_key`` line "
         "at the end of MasterKeys._setup_keys)."
+    )
+
+
+@pytest.mark.parametrize(
+    "our_entry",
+    [
+        # ``send_aes_key_event`` records an empty entry if there is no public key.
+        {},
+        # The host is not yet in the ``peers`` dict at all.
+        None,
+    ],
+)
+async def test_handle_pool_publish_peer_without_our_key_yet(
+    cluster_master_opts, caplog, our_entry
+):
+    """
+    Regression test for issue #70565.
+
+    A peer that has not learned our public key yet must not raise out of the
+    event-polling loop.
+    """
+    from tests.support.mock import AsyncMock, MagicMock
+
+    bare_id = cluster_master_opts["id"].removesuffix("_master")
+    peers = {} if our_entry is None else {bare_id: our_entry}
+    sibling_data = {"peer_id": "salt-master-2", "peers": peers}
+    tag = salt.utils.event.tagify("salt-master-2", "peer", "cluster")
+    payload = salt.utils.event.SaltEvent.pack(tag, sibling_data)
+
+    channel = server.MasterPubServerChannel.__new__(server.MasterPubServerChannel)
+    channel.opts = cluster_master_opts
+    channel.peer_keys = {}
+    channel.auth_errors = {"salt-master-2": [], "salt-master-3": []}
+    channel.transport = MagicMock()
+    channel.transport.publish_payload = AsyncMock()
+    # Never reached once the empty entry is recognised; a bare mock is enough
+    # to prove the handler returns before any crypto is attempted.
+    channel.master_key = MagicMock()
+
+    with caplog.at_level(logging.INFO):
+        await channel.handle_pool_publish(payload)
+
+    assert (
+        "salt-master-2" not in channel.peer_keys
+    ), "nothing should be cached from an announce that carries no key for us"
+    assert not [
+        record for record in caplog.records if record.levelno >= logging.ERROR
+    ], "a peer that has not learned our key yet is a transient, not an error"
+    assert any(
+        "no AES key for us yet" in record.getMessage() for record in caplog.records
+    ), "the skipped round must say why it was skipped"
+
+
+async def test_send_state_sync_chunks_closes_its_pusher(cluster_master_opts):
+    """
+    Regression test for issue #70561.
+
+    The state-sync sender must close the pusher it created.
+    """
+    from tests.support.mock import MagicMock, patch
+
+    channel = server.MasterPubServerChannel.__new__(server.MasterPubServerChannel)
+    channel.opts = cluster_master_opts
+    channel.transport = MagicMock()
+
+    fake_pusher = MagicMock()
+    channel.pusher = MagicMock(return_value=fake_pusher)
+
+    secrets = {"cluster_aes": {"secret": MagicMock()}}
+    with patch.object(SMaster, "secrets", secrets), patch.object(
+        salt.crypt, "Crypticle", MagicMock()
+    ), patch(
+        "salt.cluster.state_sync.iter_keys_chunks",
+        side_effect=RuntimeError("state-sync unavailable"),
+    ), patch(
+        "salt.cluster.state_sync.iter_root_chunks",
+        side_effect=RuntimeError("state-sync unavailable"),
+    ):
+        # Must not raise -- the handler logs the abort and cleans up.
+        await channel._send_state_sync_chunks("session-1", "salt-master-2")
+
+    channel.pusher.assert_called_once_with("salt-master-2")
+    fake_pusher.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "interface,expected_bind",
+    [
+        ("[::]", "::"),
+        ("[2001:db8::1]", "2001:db8::1"),
+        ("0.0.0.0", "0.0.0.0"),
+        ("2001:db8::1", "2001:db8::1"),
+    ],
+)
+def test_publish_daemon_binds_pool_puller_without_brackets(interface, expected_bind):
+    """
+    Regression test for issue #70559.
+
+    The cluster pool puller must bind a bare address even if given a bracketed IPv6 one.
+    """
+    from tests.support.mock import MagicMock, patch
+
+    channel = server.MasterPubServerChannel.__new__(server.MasterPubServerChannel)
+    channel.opts = {
+        "event_publisher_niceness": 0,
+        "cluster_id": "testcluster",
+        "cluster_pool_port": 4520,
+        "cluster_peers": ["192.168.0.2"],
+        "interface": interface,
+        "id": "salt-master-1_master",
+    }
+    channel._has_joined_cluster = MagicMock(return_value=False)
+    channel.pusher = MagicMock()
+    channel._add_pusher = MagicMock()
+    channel.transport = MagicMock()
+    # Skip the ``if hasattr(self.transport, "publisher"):`` branch in
+    # ``_publish_daemon`` -- it calls ``salt.utils.asynchronous.aioloop``
+    # on ``self.io_loop``, which rejects a bare MagicMock.  This test only
+    # exercises the cluster pool-puller bind path, not the local IPC
+    # publisher setup.
+    del channel.transport.publisher
+
+    # A MagicMock io_loop makes ``start()`` return immediately, so the daemon
+    # runs to its ``finally: self.close()`` without driving tornado.  The
+    # suppress block handles anything _publish_daemon raises AFTER the
+    # TCPPuller bind we care about (the Raft bring-up branch below the
+    # bind needs a real asyncio loop).
+    with patch("tornado.ioloop.IOLoop.current", return_value=MagicMock()), patch(
+        "salt.transport.tcp.TCPPuller"
+    ) as fake_puller:
+        try:
+            channel._publish_daemon()
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+    assert fake_puller.call_args.kwargs["host"] == expected_bind
+
+
+# ---------------------------------------------------------------------------
+# MasterPubServerChannel.factory --- cluster_peers gate (BUG regression)
+#
+# A topology-only solo master sets ``cluster_id`` but leaves
+# ``cluster_peers`` empty.  Before commit ``b7c0cdf5a4d`` the factory
+# gated the 3008.x TCP-based cluster branch on ``cluster_id`` alone,
+# so those masters took the TCP path -- and on Windows the TCP
+# ``pub_sock.bind(publish_port)`` collided with the already-bound
+# tornado publisher on the same port.  The gate must require BOTH
+# ``cluster_id`` and a non-empty ``cluster_peers`` list.
+# ---------------------------------------------------------------------------
+
+
+def _factory_test_opts(tmp_path, **extra):
+    """Minimal opts dict that lets ``MasterPubServerChannel.factory``
+    reach the gate branch without hitting other attribute lookups.
+    ``__init__`` reads ``opts["cluster_peers"]`` unconditionally so the
+    base opts default it to ``[]`` -- tests exercising the empty-peers
+    gate leave it alone; tests exercising the TCP branch override."""
+    sock = tmp_path / "sock"
+    sock.mkdir(exist_ok=True)
+    opts = {
+        "id": "salt-master-1_master",
+        "sock_dir": str(sock),
+        "interface": "127.0.0.1",
+        "publish_port": 4505,
+        "cluster_pool_port": 4511,
+        "tcp_master_pub_port": 4512,
+        "tcp_master_pull_port": 4513,
+        "cluster_peers": [],
+    }
+    opts.update(extra)
+    return opts
+
+
+def test_master_pub_server_channel_factory_takes_tcp_branch_with_peers(tmp_path):
+    """``cluster_id`` + non-empty ``cluster_peers`` → the 3008.x
+    master-cluster TCP branch (``salt.transport.tcp.PublishServer``)."""
+    opts = _factory_test_opts(tmp_path, cluster_id="prod", cluster_peers=["127.0.0.2"])
+    tcp_mock = MagicMock(name="tcp.PublishServer")
+    ipc_mock = MagicMock(name="ipc_publish_server")
+
+    with patch("salt.transport.tcp.PublishServer", tcp_mock), patch(
+        "salt.transport.ipc_publish_server", ipc_mock
+    ), patch("salt.crypt.MasterKeys", MagicMock()):
+        server.MasterPubServerChannel.factory(opts)
+
+    assert tcp_mock.called, "TCP branch not taken for a true 3008.x cluster peer"
+    assert (
+        not ipc_mock.called
+    ), "ipc_publish_server must NOT be used when cluster_peers is populated"
+
+
+def test_master_pub_server_channel_factory_takes_ipc_branch_without_peers(tmp_path):
+    """``cluster_id`` set but ``cluster_peers`` empty (topology-only
+    solo master) → the ``ipc_publish_server`` branch.  The TCP branch
+    would collide with the IPC publisher on Windows (both bind
+    ``publish_port``) and cause ``SaltMasterError: Publish server did
+    not start``."""
+    opts = _factory_test_opts(tmp_path, cluster_id="prod", cluster_peers=[])
+    tcp_mock = MagicMock(name="tcp.PublishServer")
+    ipc_mock = MagicMock(name="ipc_publish_server")
+
+    with patch("salt.transport.tcp.PublishServer", tcp_mock), patch(
+        "salt.transport.ipc_publish_server", ipc_mock
+    ), patch("salt.crypt.MasterKeys", MagicMock()):
+        server.MasterPubServerChannel.factory(opts)
+
+    assert (
+        ipc_mock.called
+    ), "ipc_publish_server branch not taken for topology-only solo master"
+    assert not tcp_mock.called, (
+        "TCP branch must NOT be taken when cluster_peers is empty -- "
+        "regression for the Windows publish-port collision"
+    )
+
+
+def test_master_pub_server_channel_factory_takes_ipc_branch_without_cluster_id(
+    tmp_path,
+):
+    """Plain (non-cluster, non-topology) master takes the ``ipc_publish_server``
+    branch.  Verifies the gate still excludes masters that set neither
+    cluster_id nor cluster_peers."""
+    opts = _factory_test_opts(tmp_path)
+    opts.pop("cluster_id", None)
+    tcp_mock = MagicMock(name="tcp.PublishServer")
+    ipc_mock = MagicMock(name="ipc_publish_server")
+
+    with patch("salt.transport.tcp.PublishServer", tcp_mock), patch(
+        "salt.transport.ipc_publish_server", ipc_mock
+    ), patch("salt.crypt.MasterKeys", MagicMock()):
+        server.MasterPubServerChannel.factory(opts)
+
+    assert ipc_mock.called
+    assert not tcp_mock.called
+
+
+# ---------------------------------------------------------------------------
+# MasterPubServerChannel.factory --- Windows clustered event-bus ports
+#
+# Historically the Windows clustered branch of ``factory`` bound the
+# primary transport's TCP pub/pull to ``publish_port`` /
+# ``cluster_pool_port`` because ``pub_path``/``pull_path`` were nulled
+# (no AF_UNIX on Windows).  Two port collisions followed:
+#
+# 1. ``publish_port`` is also bound by the regular ``PubServerChannel``
+#    the master spawns at ``salt/master.py:1262``; the second ZMQ
+#    ``pub_sock.bind()`` on the same TCP port hung indefinitely on
+#    Windows, so the publish daemon's ``started`` event never fired and
+#    ``Master.start()`` sat in ``chan.transport.started.wait(60)`` until
+#    ``salt-factories`` killed the master as timed-out.
+# 2. ``cluster_pool_port`` is the port the ``_publish_daemon``'s own
+#    ``pool_puller`` (TCPPuller for cluster-peer traffic) already owns.
+#    The primary's pull socket racing it is why the factory needed an
+#    ``errno.EADDRINUSE`` fallback to ``pull_port=0``.
+#
+# The fix is to bind the event-bus port pair (``tcp_master_pub_port`` /
+# ``tcp_master_pull_port``) on Windows --- the direct TCP equivalent of
+# the ``master_event_pub.ipc`` / ``master_event_pull.ipc`` role the
+# primary transport plays on Linux.  ``_ipc_loopback`` hard-codes
+# ``127.0.0.1`` for the matching client side (``ipc_publish_client`` and
+# ``ipc_publish_server`` in ``salt/transport/base.py``), so the bind host
+# must also be the loopback literal rather than ``opts["interface"]``
+# (which is peer 2's ``127.0.0.2`` in the test harness).
+# ---------------------------------------------------------------------------
+
+
+def test_master_pub_server_channel_factory_windows_binds_event_bus_ports(tmp_path):
+    """On Windows clustered, the primary transport MUST bind the
+    event-bus ports (``tcp_master_pub_port`` / ``tcp_master_pull_port``)
+    on ``127.0.0.1``, NOT ``publish_port`` / ``cluster_pool_port``.
+
+    Regression for the Windows 3-peer cluster hang:
+    ``test_single_cluster_multi_peer`` could not start more than one
+    peer because the second ZMQ ``pub_sock.bind(publish_port)`` hung on
+    the collision with the regular ``PubServerChannel``.  The primary
+    transport serves the master event bus (same role as
+    ``master_event_pub.ipc`` on Linux), which lives at
+    ``tcp_master_pub_port``/``tcp_master_pull_port``.
+    """
+    opts = _factory_test_opts(
+        tmp_path,
+        cluster_id="west",
+        cluster_peers=["127.0.0.2", "127.0.0.3"],
+        interface="127.0.0.2",
+        publish_port=63084,
+        cluster_pool_port=63085,
+        tcp_master_pub_port=63096,
+        tcp_master_pull_port=63097,
+    )
+    tcp_mock = MagicMock(name="tcp.PublishServer")
+
+    with patch("salt.transport.tcp.PublishServer", tcp_mock), patch(
+        "salt.utils.platform.is_windows", return_value=True
+    ), patch("salt.crypt.MasterKeys", MagicMock()):
+        server.MasterPubServerChannel.factory(opts)
+
+    assert tcp_mock.called, "tcp.PublishServer not instantiated on Windows clustered"
+    kwargs = tcp_mock.call_args.kwargs
+    # The event-bus ports, NOT the minion-facing publish_port or the
+    # cluster_pool_port.
+    assert kwargs["pub_port"] == 63096, (
+        f"Windows clustered primary bound pub_port={kwargs['pub_port']!r}; "
+        "expected tcp_master_pub_port=63096.  Binding publish_port here "
+        "collides with the regular PubServerChannel at master.py:1262 and "
+        "hangs the publish daemon."
+    )
+    assert kwargs["pull_port"] == 63097, (
+        f"Windows clustered primary bound pull_port={kwargs['pull_port']!r}; "
+        "expected tcp_master_pull_port=63097.  Binding cluster_pool_port "
+        "here collides with the pool_puller TCPPuller in _publish_daemon."
+    )
+    # Must bind on the loopback literal ``_ipc_loopback`` uses, not
+    # ``opts["interface"]`` -- otherwise in-process ``get_master_event()``
+    # clients connect to 127.0.0.1 and miss the listener bound on 127.0.0.2.
+    assert kwargs["pub_host"] == "127.0.0.1", (
+        f"Windows clustered primary pub_host={kwargs['pub_host']!r}; "
+        "expected 127.0.0.1 to match ``_ipc_loopback``."
+    )
+    assert kwargs["pull_host"] == "127.0.0.1", (
+        f"Windows clustered primary pull_host={kwargs['pull_host']!r}; "
+        "expected 127.0.0.1 to match ``_ipc_loopback``."
+    )
+    # IPC paths must be nulled (no AF_UNIX on Windows), forcing
+    # tcp.PublishServer.publisher() through its TCP branch.
+    assert kwargs["pub_path"] is None
+    assert kwargs["pull_path"] is None
+
+
+# ---------------------------------------------------------------------------
+# PubServerChannel pickle round-trip (Windows spawn regression)
+#
+# Windows ``multiprocessing`` uses ``spawn`` and pickles the channel
+# across the parent -> child boundary.  ``__setstate__`` must restore
+# the same attribute names that ``__getstate__`` reads.  A long-standing
+# typo (commit ``3e8f10b5b34``, 2022) wrote
+# ``self.state = state["presence_events"]`` instead of
+# ``self.presence_events = state["presence_events"]``, so a child that
+# itself spawned another subprocess would AttributeError in
+# ``__getstate__`` with
+# ``'PubServerChannel' object has no attribute 'presence_events'``.
+# Reproduced on Windows CI run 41358216263 / scenarios-zeromq.
+# ---------------------------------------------------------------------------
+
+
+def test_pub_server_channel_setstate_restores_presence_events_attr():
+    """``__setstate__`` must write the ``presence_events`` ATTRIBUTE
+    (not ``self.state``) so a subsequent ``__getstate__`` round-trip
+    doesn't AttributeError on Windows multiprocessing re-pickle."""
+    bare = server.PubServerChannel.__new__(server.PubServerChannel)
+    state = {
+        "opts": {"id": "test-master", "pki_dir": "/tmp/does-not-matter"},
+        "transport": MagicMock(),
+        "presence_events": True,
+    }
+
+    with patch("salt.utils.event.get_event", MagicMock()), patch(
+        "salt.utils.minions.CkMinions", MagicMock()
+    ), patch("salt.crypt.MasterKeys", MagicMock()):
+        bare.__setstate__(state)
+
+    assert hasattr(bare, "presence_events"), (
+        "__setstate__ must restore ``presence_events`` as a named "
+        "attribute, not ``self.state`` -- otherwise a Windows re-pickle "
+        "fails in ``__getstate__``"
+    )
+    assert bare.presence_events is True
+
+
+def test_pub_server_channel_round_trip_pickle_preserves_getstate():
+    """End-to-end: unpickled instance must survive a second
+    ``__getstate__`` without AttributeError.  Mirrors the Windows
+    cascade where a parent spawns a child that itself spawns a
+    grandchild."""
+    bare = server.PubServerChannel.__new__(server.PubServerChannel)
+    state = {
+        "opts": {"id": "test-master", "pki_dir": "/tmp/does-not-matter"},
+        "transport": MagicMock(),
+        "presence_events": False,
+    }
+
+    with patch("salt.utils.event.get_event", MagicMock()), patch(
+        "salt.utils.minions.CkMinions", MagicMock()
+    ), patch("salt.crypt.MasterKeys", MagicMock()):
+        bare.__setstate__(state)
+        round_trip = bare.__getstate__()
+
+    assert round_trip["presence_events"] is False
+    assert "opts" in round_trip
+    assert "transport" in round_trip
+
+
+# ---------------------------------------------------------------------------
+# PR #70651: MasterPubServerChannel pickle hooks round-trip ``SMaster.secrets``
+# so the EventPublisher subprocess on Windows (``multiprocessing.spawn``)
+# inherits the parent's ``cluster_aes`` / ``aes`` entries.  Without these
+# hooks, the Windows EventPublisher starts with an empty class-attribute
+# ``SMaster.secrets``, and the topology inbound listener fails to open
+# with ``KeyError('cluster_aes')`` when its ``ReqServerChannel.post_fork``
+# evaluates ``self.aes_key``.  The topology ``topology_link_port`` then
+# has no bound REP socket and peer handshakes time out.
+# ---------------------------------------------------------------------------
+
+
+def test_master_pub_server_channel_getstate_captures_smaster_secrets():
+    """``MasterPubServerChannel.__getstate__`` must capture a snapshot
+    of ``SMaster.secrets`` under ``_secrets`` so the Windows spawned
+    EventPublisher can restore the class attribute."""
+    sentinel_secrets = {
+        "cluster_aes": {"secret": object()},
+        "aes": {"secret": object()},
+    }
+    saved = salt.master.SMaster.secrets
+    try:
+        salt.master.SMaster.secrets = sentinel_secrets
+        channel = server.MasterPubServerChannel.__new__(server.MasterPubServerChannel)
+        channel.opts = {"cluster_id": "east"}
+        channel.transport = MagicMock()
+
+        state = channel.__getstate__()
+    finally:
+        salt.master.SMaster.secrets = saved
+
+    assert state.get("_secrets") is sentinel_secrets, (
+        "MasterPubServerChannel.__getstate__ must round-trip "
+        "SMaster.secrets under '_secrets' so the EventPublisher "
+        "subprocess on Windows inherits ``cluster_aes``."
+    )
+    # Minimal pickle shape -- just opts + transport + the secrets
+    # snapshot.  ``_publish_daemon`` rebuilds ``io_loop``, ``master_key``,
+    # etc. from scratch in the child.
+    assert state["opts"]["cluster_id"] == "east"
+    assert state["transport"] is channel.transport
+
+
+def test_master_pub_server_channel_setstate_restores_smaster_secrets():
+    """``MasterPubServerChannel.__setstate__`` must restore
+    ``SMaster.secrets`` from the pickle so the EventPublisher child
+    process can look up ``cluster_aes`` without KeyError.
+
+    ``MasterKeys`` is patched out because ``__setstate__`` also
+    reconstructs ``self.master_key`` for the Windows-spawn boundary
+    (see the Windows event-bus fix) and that requires a full master
+    config this unit test does not carry.
+    """
+    sentinel_secrets = {"cluster_aes": {"secret": object()}}
+    saved = salt.master.SMaster.secrets
+    try:
+        salt.master.SMaster.secrets = {}
+        channel = server.MasterPubServerChannel.__new__(server.MasterPubServerChannel)
+        state = {
+            "opts": {"cluster_id": "east", "cluster_peers": []},
+            "transport": MagicMock(),
+            "_secrets": sentinel_secrets,
+        }
+        with patch("salt.crypt.MasterKeys", MagicMock()):
+            channel.__setstate__(state)
+
+        assert salt.master.SMaster.secrets is sentinel_secrets, (
+            "MasterPubServerChannel.__setstate__ must install the "
+            "pickled ``_secrets`` dict as the class attribute so the "
+            "EventPublisher child can resolve cluster_aes."
+        )
+    finally:
+        salt.master.SMaster.secrets = saved
+
+
+def test_master_pub_server_channel_setstate_tolerates_missing_secrets_key():
+    """Older pickles (pre-#70651) do not carry ``_secrets``; the
+    restore path must not crash on the missing key so an in-flight
+    rolling upgrade across the Windows-spawn boundary degrades
+    gracefully (worst case: back to the old KeyError, not an
+    AttributeError before the daemon has a chance to log)."""
+    sentinel = {"aes": {"secret": object()}}
+    saved = salt.master.SMaster.secrets
+    try:
+        salt.master.SMaster.secrets = sentinel
+        channel = server.MasterPubServerChannel.__new__(server.MasterPubServerChannel)
+        with patch("salt.crypt.MasterKeys", MagicMock()):
+            channel.__setstate__(
+                {
+                    "opts": {"cluster_id": "east", "cluster_peers": []},
+                    "transport": MagicMock(),
+                }
+            )
+
+        # No ``_secrets`` carried -> SMaster.secrets left untouched.
+        assert salt.master.SMaster.secrets is sentinel
+    finally:
+        salt.master.SMaster.secrets = saved
+
+
+def test_master_pub_server_channel_pickle_round_trip_restores_cluster_aes():
+    """End-to-end: pickle + unpickle round-trip of a
+    ``MasterPubServerChannel`` instance must leave
+    ``SMaster.secrets["cluster_aes"]`` reachable.  This is the exact
+    code path exercised by ``multiprocessing.spawn`` on Windows when
+    ``process_manager.add_process(self._publish_daemon, name=
+    "EventPublisher")`` forks the EventPublisher subprocess.
+    """
+    import pickle
+
+    # Plain picklable sentinel for the ``secret`` value.  The real
+    # value on a running master is a ``multiprocessing.Array`` whose
+    # cross-process semantics are provided by the spawn machinery
+    # itself; this test exercises the pickle-pair round-trip, which
+    # is independent of the shared-memory handle kind.
+    sentinel_aes = b"x" * 32
+    saved = salt.master.SMaster.secrets
+    try:
+        salt.master.SMaster.secrets = {"cluster_aes": {"secret": sentinel_aes}}
+        channel = server.MasterPubServerChannel.__new__(server.MasterPubServerChannel)
+        channel.opts = {"cluster_id": "east", "cluster_peers": []}
+        # transport is replaced with None so the whole instance is
+        # pickleable end-to-end.
+        channel.transport = None
+        raw = pickle.dumps(channel)
+        # Clear SMaster.secrets to simulate the Windows-spawn child's
+        # fresh module import.
+        salt.master.SMaster.secrets = {}
+        # Patch ``MasterKeys`` since ``__setstate__`` also rebuilds
+        # ``self.master_key`` for the Windows-spawn boundary and that
+        # requires a full master config this test does not carry.
+        with patch("salt.crypt.MasterKeys", MagicMock()):
+            _ = pickle.loads(raw)
+
+        assert "cluster_aes" in salt.master.SMaster.secrets, (
+            "After unpickling the channel, ``SMaster.secrets`` must "
+            "have the ``cluster_aes`` entry installed by "
+            "``__setstate__`` -- otherwise the EventPublisher's "
+            "topology inbound listener fails with KeyError."
+        )
+        assert salt.master.SMaster.secrets["cluster_aes"]["secret"] == sentinel_aes
+    finally:
+        salt.master.SMaster.secrets = saved
+
+
+async def test_cluster_join_handler_skips_joiner_in_notify_broadcast(tmp_path):
+    """
+    Regression: ``cluster/peer/join`` handler must not fan out
+    ``cluster/peer/join-notify`` to the newly-joining peer.
+
+    On cluster bootstrap the join-handler appends the joiner to
+    ``self.pushers`` so later broadcasts reach it, then loops over
+    ``self.pushers`` to publish a ``join-notify`` encrypted with the
+    receiver's current ``cluster_aes``.  The joiner's local
+    ``cluster_aes`` at the moment the notify arrives is still its
+    pre-join placeholder (``K_b``), NOT the authoritative ``K_a`` the
+    receiver uses.  The joiner's handler decrypts with ``K_b`` and
+    emits a cosmetic-but-noisy ``AuthenticationError`` traceback
+    ~80ms before the ``join-reply`` arrives and installs the
+    authoritative ``cluster_aes``.
+
+    The fix filters the joiner out of the fan-out loop by
+    ``pusher.pull_host == payload["peer_id"]``.  The joiner learns
+    everything it needs from the ``join-reply`` sent later in the
+    same handler.
+
+    Invariants verified:
+
+    #. The pre-existing peer still receives ``join-notify`` (membership
+       announcement is preserved).
+    #. The newly-joining peer does NOT receive ``join-notify``.
+    """
+    # ---- Opts & on-disk layout ---------------------------------------
+    pki = tmp_path / "pki"
+    (pki / "peers").mkdir(parents=True)
+    opts = {
+        "id": "master-a_master",
+        "cluster_id": "test_cluster",
+        "cluster_peers": ["127.0.0.3"],
+        "cluster_pki_dir": str(pki),
+        "cluster_encryption_algorithm": "OAEP-SHA1",
+        "publish_signing_algorithm": "PKCS1v15-SHA224",
+        "cluster_secret": "",
+        "cluster_isolated_filesystem": False,
+        "sock_dir": str(tmp_path / "sock"),
+    }
+    (tmp_path / "sock").mkdir()
+
+    # ---- Channel -----------------------------------------------------
+    channel = server.MasterPubServerChannel.__new__(server.MasterPubServerChannel)
+    channel.opts = opts
+    channel.cluster_peers = ["127.0.0.3"]
+    channel._raft_dispatcher = None
+    channel._raft_service = None
+    channel.send_aes_key_event = MagicMock()
+    channel.cluster_key = MagicMock(return_value="")
+    channel.cluster_public_key = MagicMock(return_value="")
+    channel.private_key = MagicMock(return_value=b"-----FAKE-PRIV-----")
+
+    # ``gen_token`` returns a str, and ``_discover_candidates`` stores
+    # the str token.  The joiner echoes it back as ``return_token``
+    # (str, round-tripped through ``salt.payload``).  Both ``secret``
+    # and ``key`` are RSA-decrypted to bytes ``token.encode() + ...``
+    # and sliced by ``len(token)`` which matches the str length.
+    token = "test-token-0000000000000000000000"
+    joiner_id = "127.0.0.4"
+    joiner_pub_pem = (
+        "-----BEGIN PUBLIC KEY-----\nJOINER-PUB\n-----END PUBLIC KEY-----\n"
+    )
+    channel._discover_candidates = {joiner_id: (joiner_pub_pem, token)}
+
+    # ---- Master key ---------------------------------------------------
+    fake_master_key = MagicMock()
+    fake_master_key.master_rsa_path = str(tmp_path / "master.pem")
+    channel.master_key = fake_master_key
+
+    # ---- Pushers -----------------------------------------------------
+    # One pre-existing (127.0.0.3), one added by the handler for the
+    # joiner (127.0.0.4).  Build the pre-existing one up-front; the
+    # handler adds the joiner's via ``_add_pusher`` which we intercept
+    # so we can observe it the same way.
+    pre_existing_pusher = MagicMock()
+    pre_existing_pusher.pull_host = "127.0.0.3"
+    pre_existing_pusher.pull_port = 4520
+    pre_existing_pusher.publish = AsyncMock()
+    channel.pushers = [pre_existing_pusher]
+
+    joiner_pusher = MagicMock()
+    joiner_pusher.pull_host = joiner_id
+    joiner_pusher.pull_port = 4520
+    joiner_pusher.publish = AsyncMock()
+
+    # ``self.pusher(peer)`` is called twice in the handler: once to
+    # build the pusher appended via ``_add_pusher``, and once for
+    # the reply pusher at the end.  Return the shared ``joiner_pusher``
+    # both times -- the reply pusher gets ``.close()`` called on it.
+    channel.pusher = MagicMock(return_value=joiner_pusher)
+    channel._add_pusher = MagicMock(side_effect=channel.pushers.append)
+
+    # ---- Crypto stubs ------------------------------------------------
+    # ``PublicKeyString(joiner_pub).verify(...)`` returns True so the
+    # sig check passes.  Also used to encrypt the join-reply payload;
+    # returning fixed bytes is fine because we don't decrypt the reply.
+    fake_joiner_pub = MagicMock()
+    fake_joiner_pub.verify.return_value = True
+    fake_joiner_pub.encrypt.return_value = b"wrapped-ciphertext"
+
+    # ``PrivateKey.from_file(...).decrypt(...)`` returns ``token.encode() +
+    # cluster_secret`` for the ``secret`` payload (secret == "")
+    # and ``token.encode() + aes_key`` for the ``key`` payload.  We
+    # return the same salted-bytes for both because the handler decodes
+    # each with ``[len(token):]`` and only compares the ``secret``
+    # against ``opts["cluster_secret"]`` ("" == "").
+    fake_private_key = MagicMock()
+    fake_private_key.decrypt.return_value = token.encode() + b""
+
+    # ``PrivateKeyString(...).sign(...)`` for the join-reply.
+    fake_private_key_string = MagicMock()
+    fake_private_key_string.sign.return_value = b"sig"
+
+    # ``Crypticle(...).dumps(...)`` is used inside the fan-out loop to
+    # encrypt each join-notify; a MagicMock is fine, we only assert on
+    # which pushers publish was invoked on.
+    fake_crypticle = MagicMock()
+    fake_crypticle.encrypt.return_value = b"crypt"
+    fake_crypticle.dumps.return_value = b"notify-ciphertext"
+
+    # ---- Build the inbound join payload ------------------------------
+    # Mirror exactly what the joiner emits (see the ``discover-reply``
+    # handler): ``return_token`` is the token echoed back, ``secret``
+    # and ``key`` are RSA-wrapped ciphertext, ``token`` is the joiner's
+    # own freshly-generated token (used at the end of the handler to
+    # wrap the join-reply, not for verification here).
+    inner_payload = {
+        "peer_id": joiner_id,
+        "pub": joiner_pub_pem,
+        "return_token": token,
+        "secret": b"encrypted-secret",
+        "key": b"encrypted-aes",
+        "token": token,
+    }
+    data = {
+        "payload": salt.payload.dumps(inner_payload),
+        "sig": b"sig",
+    }
+    tag = salt.utils.event.tagify("join", "peer", "cluster")
+    payload = salt.utils.event.SaltEvent.pack(tag, data)
+
+    secrets = {
+        "aes": {"secret": MagicMock(value=b"aes-secret-bytes")},
+        "cluster_aes": {"secret": MagicMock(value=b"cluster-aes-bytes")},
+    }
+
+    with patch.object(SMaster, "secrets", secrets), patch(
+        "salt.crypt.PublicKeyString", return_value=fake_joiner_pub
+    ), patch("salt.crypt.PrivateKey.from_file", return_value=fake_private_key), patch(
+        "salt.crypt.PrivateKeyString", return_value=fake_private_key_string
+    ), patch(
+        "salt.crypt.Crypticle", return_value=fake_crypticle
+    ):
+        await channel.handle_pool_publish(payload)
+
+    # ---- Assertions --------------------------------------------------
+    # Pre-existing peer MUST still receive join-notify.
+    assert pre_existing_pusher.publish.await_count == 1, (
+        "join-notify must still be broadcast to pre-existing peers; "
+        f"pre-existing pusher saw {pre_existing_pusher.publish.await_count} "
+        "publishes"
+    )
+
+    # The joiner's pusher MUST NOT receive a join-notify.  It is used
+    # only for the final join-reply (at the end of the handler); we
+    # filter by tag to distinguish.
+    joiner_publish_tags = []
+    for call in joiner_pusher.publish.await_args_list:
+        event_bytes = call.args[0]
+        try:
+            notify_tag, _ = salt.utils.event.SaltEvent.unpack(event_bytes)
+        except Exception:  # pylint: disable=broad-except
+            notify_tag = ""
+        joiner_publish_tags.append(notify_tag)
+
+    assert not any("join-notify" in t for t in joiner_publish_tags), (
+        "Regression: join-notify must not be sent to the joiner itself; "
+        f"joiner pusher received publishes tagged {joiner_publish_tags!r}. "
+        "The joiner cannot decrypt a notify encrypted with the receiver's "
+        "cluster_aes until the subsequent join-reply installs it; sending "
+        "it here produces a cosmetic AuthenticationError in the joiner's "
+        "log on every cluster bootstrap."
     )

@@ -11,7 +11,7 @@ def test_connected_ids():
     test ckminion connected_ids when
     local_port_tcp returns 127.0.0.1
     """
-    opts = salt.config.minion_config(None)
+    opts = salt.config.minion_config(None, minion_id="minions-test-minion")
     opts.update(
         {
             "publish_port": 4505,
@@ -37,7 +37,7 @@ def test_connected_ids_remote_minions():
     test ckminion connected_ids when
     detect_remote_minions is set
     """
-    opts = salt.config.minion_config(None)
+    opts = salt.config.minion_config(None, minion_id="minions-test-minion")
     opts.update(
         {
             "publish_port": 4505,
@@ -65,6 +65,37 @@ def test_connected_ids_remote_minions():
         assert ret == {minion2, minion}
 
 
+@pytest.mark.parametrize(
+    "record,expected",
+    [
+        ({"ts": 1000.0}, True),
+        ({"ts": 1000}, True),
+        ({"ts": 941.0}, True),  # 59s old, ttl is 60
+        ({"ts": 940.0}, False),  # exactly ttl old
+        ({"ts": 100.0}, False),
+        ({"ts": 1030.0}, True),  # written by a host with a faster clock
+        ({}, False),
+        ({"ts": None}, False),
+        ({"ts": "1000"}, False),
+        ({"ts": True}, False),
+        ("garbage", False),
+        (None, False),
+    ],
+)
+def test_presence_is_fresh(record, expected):
+    assert salt.utils.minions.presence_is_fresh(record, 60, now=1000.0) is expected
+
+
+def test_presence_id_tracking_defaults():
+    """
+    Presence tracking is opt-in and must be a documented, validated option.
+    """
+    assert salt.config.DEFAULT_MASTER_OPTS["presence_id_tracking"] is False
+    assert salt.config.DEFAULT_MASTER_OPTS["presence_id_ttl"] == 600
+    assert salt.config.VALID_OPTS["presence_id_tracking"] is bool
+    assert salt.config.VALID_OPTS["presence_id_ttl"] is int
+
+
 # These validate_tgt tests make the assumption that CkMinions.check_minions is
 # correct. In other words, these tests are only worthwhile if check_minions is
 # also correct.
@@ -73,7 +104,10 @@ def test_validate_tgt_returns_true_when_no_valid_minions_have_been_found():
     CKMinions is only able to check against minions the master knows about. If
     no minion keys have been accepted it will return True.
     """
-    opts = salt.config.master_config(None)
+    opts = salt.config.master_config(
+        None,
+        defaults=salt.config.DEFAULT_MASTER_OPTS.copy() | {"id": "minions-test-master"},
+    )
     ckminions = salt.utils.minions.CkMinions(opts=opts)
     with patch(
         "salt.utils.minions.CkMinions.check_minions", autospec=True, return_value={}
@@ -93,7 +127,10 @@ def test_validate_tgt_returns_true_when_no_valid_minions_have_been_found():
 def test_validate_tgt_should_return_false_when_minions_have_minions_not_in_valid_minions(
     valid_minions, target_minions
 ):
-    opts = salt.config.master_config(None)
+    opts = salt.config.master_config(
+        None,
+        defaults=salt.config.DEFAULT_MASTER_OPTS.copy() | {"id": "minions-test-master"},
+    )
     ckminions = salt.utils.minions.CkMinions(opts=opts)
     with patch(
         "salt.utils.minions.CkMinions.check_minions",
@@ -117,7 +154,10 @@ def test_validate_tgt_should_return_false_when_minions_have_minions_not_in_valid
 def test_validate_tgt_should_return_true_when_all_minions_are_found_in_valid_minions(
     valid_minions, target_minions
 ):
-    opts = salt.config.master_config(None)
+    opts = salt.config.master_config(
+        None,
+        defaults=salt.config.DEFAULT_MASTER_OPTS.copy() | {"id": "minions-test-master"},
+    )
     ckminions = salt.utils.minions.CkMinions(opts=opts)
     with patch(
         "salt.utils.minions.CkMinions.check_minions",

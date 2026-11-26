@@ -56,6 +56,7 @@ try:
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding, rsa
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
     HAS_CRYPTOGRAPHY = True
 except ImportError:
@@ -834,7 +835,13 @@ class MasterKeys(dict):
             path = f"{self.opts['keys.cache_driver']}:master_keys/{self.master_id}.pub"
 
         if force or not cache.contains("master_keys", f"{name}.pem"):
-            log.info("Generating key-pair for %s", path)
+            log.warning(
+                "Generating new master key-pair for %s. Any minion that "
+                "previously cached this master's public key will reject "
+                "the new key as a MITM attempt until its "
+                "minion_master.pub is deleted and the minion restarts.",
+                path,
+            )
             (priv, pub) = gen_keys(
                 keysize or self.opts["keysize"],
                 passphrase,
@@ -983,18 +990,55 @@ class MasterKeys(dict):
         """
         proxy to PrivateKey.sign
         """
+        self._maybe_reload_cluster_key()
         return self.key.sign(*args, **kwargs)
+
+    def _maybe_reload_cluster_key(self):
+        # The join-reply install path in ``MasterPubServerChannel`` rewrites
+        # ``cluster.pem`` in place when the founder's bytes arrive.  MWorker
+        # processes that ``_setup_keys()`` ran before that install still hold
+        # the bootstrap ``PrivateKey`` in ``self.key``, but ``get_pub_str()``
+        # already reads the current founder's ``cluster.pub`` from disk --
+        # so the pub we serve to the minion and the priv we decrypt the
+        # minion's token with come from different key pairs and every auth
+        # fails with ``Decryption failed``.  Reread from disk on each
+        # decrypt and swap ``self.key`` when the bytes have changed.
+        if not self.opts.get("cluster_id"):
+            return
+        try:
+            pem_bytes = self.cache.fetch("master_keys", "cluster.pem")
+        except Exception:  # pylint: disable=broad-except
+            return
+        if not pem_bytes:
+            return
+        if isinstance(pem_bytes, str):
+            pem_bytes_b = pem_bytes.encode()
+        else:
+            pem_bytes_b = pem_bytes
+        fp = hashlib.sha256(pem_bytes_b).hexdigest()
+        if getattr(self, "_cluster_key_fp", None) == fp:
+            return
+        try:
+            new_key = PrivateKey.from_str(pem_bytes)
+        except Exception:  # pylint: disable=broad-except
+            log.exception("Failed to reload cluster_key from disk")
+            return
+        self.cluster_key = new_key
+        self.key = new_key
+        self._cluster_key_fp = fp
 
     def decrypt(self, *args, **kwargs):
         """
         proxy to PrivateKey.decrypt
         """
+        self._maybe_reload_cluster_key()
         return self.key.decrypt(*args, **kwargs)
 
     def encrypt(self, *args, **kwargs):
         """
         proxy to PrivateKey.encrypt
         """
+        self._maybe_reload_cluster_key()
         return self.key.encrypt(*args, **kwargs)
 
     def fetch(self, name):
@@ -1012,6 +1056,144 @@ class MasterKeys(dict):
             return PublicKey.from_str(key)
         else:
             return key
+
+
+class MasterIdentityKey:
+    """
+    The topology master-identity keypair.
+
+    Thin reader/writer for the keypair used by master-topology
+    handshakes.  Separate from the master's existing ``master.pub``
+    /``master.pem`` (which signs publishes to minions):
+
+    * On a non-clustered master, generated lazily on first
+      ``topology_enabled`` start and persisted to
+      ``pki_dir/master/master_identity.{pub,pem}``.
+    * On a clustered master, the keypair is written at Raft
+      bootstrap time via the ``MASTER_IDENTITY_KEY`` log entry;
+      local persistence happens inside the Raft state-machine's
+      apply handler.  Any peer in the cluster can present the key
+      during peer-master handshakes.
+
+    This class is a pure reader/writer: lifecycle (first-generate,
+    rotation, replication) is owned by ``TopologyStateMachine``.
+    """
+
+    PUB_NAME = "master_identity.pub"
+    PRIV_NAME = "master_identity.pem"
+    PUB_MODE = 0o444
+    PRIV_MODE = 0o400
+
+    def __init__(self, opts):
+        if not opts.get("pki_dir"):
+            raise ValueError("MasterIdentityKey requires opts['pki_dir']")
+        self.opts = opts
+        self._pki_dir = os.path.join(opts["pki_dir"], "master")
+        self.pub_path = os.path.join(self._pki_dir, self.PUB_NAME)
+        self.priv_path = os.path.join(self._pki_dir, self.PRIV_NAME)
+
+    def exists(self):
+        """Return True iff both the pub and priv files are on disk."""
+        return os.path.isfile(self.pub_path) and os.path.isfile(self.priv_path)
+
+    def load(self):
+        """
+        Return ``(pub_pem, priv_pem)`` as bytes.
+
+        Raises ``FileNotFoundError`` (via ``open``) when either file
+        is absent; callers should guard with :meth:`exists` or catch.
+        """
+        with salt.utils.files.fopen(self.pub_path, "rb") as fp:
+            pub_pem = fp.read()
+        with salt.utils.files.fopen(self.priv_path, "rb") as fp:
+            priv_pem = fp.read()
+        return pub_pem, priv_pem
+
+    def write(self, pub_pem, priv_pem):
+        """
+        Persist the keypair with strict permissions (0400 priv,
+        0444 pub).  Idempotent: if the on-disk content already
+        matches, neither file is re-written and mtimes are preserved.
+        """
+        if not isinstance(pub_pem, bytes) or not isinstance(priv_pem, bytes):
+            raise TypeError("pub_pem and priv_pem must be bytes")
+        if not os.path.isdir(self._pki_dir):
+            os.makedirs(self._pki_dir, exist_ok=True)
+        if not os.access(self._pki_dir, os.W_OK):
+            raise OSError(
+                'Write access denied to "{}" for user "{}".'.format(
+                    os.path.abspath(self._pki_dir), getpass.getuser()
+                )
+            )
+        self._write_if_changed(self.priv_path, priv_pem, self.PRIV_MODE)
+        self._write_if_changed(self.pub_path, pub_pem, self.PUB_MODE)
+
+    @staticmethod
+    def _write_if_changed(path, data, mode):
+        """
+        Write ``data`` to ``path`` with ``mode`` unless the existing
+        file already contains the same bytes with the same mode.  The
+        file is created with a restrictive umask so bytes-on-disk
+        never widen past ``mode`` even for an instant.
+        """
+        if os.path.isfile(path):
+            try:
+                with salt.utils.files.fopen(path, "rb") as fp:
+                    existing = fp.read()
+            except OSError:
+                existing = None
+            if existing == data:
+                current_mode = stat.S_IMODE(os.stat(path).st_mode)
+                if current_mode == mode:
+                    return
+                os.chmod(path, mode)
+                return
+            # The private key is written 0400 and would otherwise be
+            # unopenable for writing on rotation; remove it first so
+            # the open() below can create a fresh file with a
+            # restrictive umask.
+            #
+            # Windows semantics: a 0400 file is read-only in NTFS and
+            # ``os.unlink`` raises ``PermissionError``.  Clear the
+            # read-only attribute first so the unlink succeeds and
+            # the subsequent write does not blow up with
+            # ``[Errno 13] Permission denied`` / ``[WinError 5]``.
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        with salt.utils.files.set_umask(0o277):
+            with salt.utils.files.fopen(path, "wb") as fp:
+                fp.write(data)
+        os.chmod(path, mode)
+
+    def fingerprint(self):
+        """
+        Return the public-key fingerprint using ``opts["hash_type"]``
+        (default ``sha256``).  Returns an empty string if the key is
+        not yet on disk, matching :func:`salt.utils.crypt.pem_finger`.
+        """
+        sum_type = self.opts.get("hash_type", "sha256")
+        return salt.utils.crypt.pem_finger(path=self.pub_path, sum_type=sum_type)
+
+    def generate(self, key_size=None):
+        """
+        Generate a fresh RSA keypair and return ``(pub_pem, priv_pem)``
+        as bytes.  Does NOT write to disk; the caller (or
+        :class:`TopologyStateMachine`) is responsible for persistence.
+
+        ``key_size`` defaults to ``opts["keysize"]`` or 2048.
+        """
+        bits = key_size or self.opts.get("keysize") or 2048
+        priv_str, pub_str = gen_keys(bits)
+        return (
+            salt.utils.stringutils.to_bytes(pub_str),
+            salt.utils.stringutils.to_bytes(priv_str),
+        )
 
 
 def _auth_singleton_key(opts):
@@ -1108,8 +1290,23 @@ class AsyncAuth:
         self.opts = opts
         self.token = salt.utils.stringutils.to_bytes(Crypticle.generate_key_string())
         self.cache = salt.cache.Cache(opts, driver=opts["keys.cache_driver"])
-        self.pub_path = os.path.join(self.opts["pki_dir"], "minion.pub")
-        self.rsa_path = os.path.join(self.opts["pki_dir"], "minion.pem")
+        # Determine paths based on role
+        if self.opts.get("__role") == "client":
+            # Remote CLI client
+            self.pub_path = os.path.join(self.opts["pki_dir"], "client.pub")
+            self.rsa_path = os.path.join(self.opts["pki_dir"], "client.pem")
+            self.mpub = "client_master.pub"
+        elif self.opts["__role"] == "syndic":
+            # Syndic (master of masters)
+            self.pub_path = os.path.join(self.opts["pki_dir"], "minion.pub")
+            self.rsa_path = os.path.join(self.opts["pki_dir"], "minion.pem")
+            self.mpub = "syndic_master.pub"
+        else:
+            # Regular minion (default)
+            self.pub_path = os.path.join(self.opts["pki_dir"], "minion.pub")
+            self.rsa_path = os.path.join(self.opts["pki_dir"], "minion.pem")
+            self.mpub = "minion_master.pub"
+
         self._private_key = None
         # Initialize ``_creds`` so ``_authenticate`` can safely check it even
         # when a sibling ``AsyncAuth`` populates ``creds_map`` between our
@@ -1119,10 +1316,21 @@ class AsyncAuth:
         # later raises ``AttributeError`` on ``self._creds["aes"]`` (see
         # issue #67947).
         self._creds = None
-        if self.opts["__role"] == "syndic":
-            self.mpub = "syndic_master.pub"
-        else:
-            self.mpub = "minion_master.pub"
+        # Per-caller sign-in bookkeeping.  See :meth:`authenticate` for the
+        # design rationale; the short version is that each caller gets its
+        # own Future and ``_sign_in_task`` is the shared in-flight task
+        # that fans results out to the ``_waiters`` set.  ``_last_result``
+        # carries the cached outcome across ``authenticate()`` calls:
+        # ``None`` means "no completed sign-in", ``(True,)`` means the last
+        # sign-in succeeded (equivalent to the old
+        # ``_authenticate_future.done() and exception() is None`` check).
+        # Failures are *not* cached -- a subsequent ``authenticate()`` call
+        # spawns a fresh sign-in task, matching the pre-refactor behavior
+        # where the retry wiring in ``authenticate()`` saw a done-with-
+        # exception future and allocated a new one.
+        self._sign_in_task = None
+        self._waiters = set()
+        self._last_result = None
         if not os.path.isfile(self.pub_path):
             self.get_keys()
         if io_loop is None:
@@ -1138,8 +1346,7 @@ class AsyncAuth:
             self._creds = creds
             self._crypticle = Crypticle(self.opts, creds["aes"])
             self._session_crypticle = Crypticle(self.opts, creds["session"])
-            self._authenticate_future = tornado.concurrent.Future()
-            self._authenticate_future.set_result(True)
+            self._last_result = (True,)
 
     def __deepcopy__(self, memo):
         cls = self.__class__
@@ -1169,45 +1376,191 @@ class AsyncAuth:
     @property
     def authenticated(self):
         return (
-            hasattr(self, "_authenticate_future")
-            and self._authenticate_future.done()
-            and self._authenticate_future.exception() is None
+            self._last_result is not None
+            and len(self._last_result) == 1
+            and self._last_result[0] is True
         )
 
     def invalidate(self):
         if self.authenticated:
-            del self._authenticate_future
+            self._last_result = None
             key = self.__key(self.opts)
             if key in AsyncAuth.creds_map:
                 del AsyncAuth.creds_map[key]
 
     def authenticate(self, callback=None):
         """
-        Ask for this client to reconnect to the origin
+        Return a Future that resolves to ``True`` when a sign-in with the
+        master completes, or raises the sign-in error on failure.
 
-        This function will de-dupe all calls here and return a *single* future
-        for the sign-in-- whis way callers can all assume there aren't others
+        Each call returns a **fresh** Future owned by the caller.  Multiple
+        concurrent callers share a single in-flight sign-in task
+        (``self._sign_in_task``); when that task completes, its outcome --
+        including unexpected exceptions like ``OSError`` that would
+        otherwise escape ``_authenticate`` as an unhandled task exception
+        -- is fanned out to every registered waiter.
+
+        This replaces the previous design in which every caller shared one
+        ``_authenticate_future`` attribute.  That design conflated "the
+        handle to await the sign-in result" with "the flag marking a
+        sign-in in progress"; a stale coroutine reaching its tail could
+        hit a future already resolved by a sibling and raise
+        ``asyncio.exceptions.InvalidStateError``, killing the task and
+        wedging the minion in a non-authenticated state until process
+        restart.  It also silently hung every waiter
+        when ``_authenticate`` raised anything outside the handled sign-in
+        failure branches (issue #70642), and leaked the sign-in task's
+        request channel when all waiters gave up.
+
+        Cancellation semantics:
+
+        - A caller cancelling its returned future only removes itself from
+          ``_waiters``; the sign-in task and other waiters are untouched.
+        - When ``_waiters`` drains to empty while a sign-in is still in
+          flight, that sign-in task is cancelled so it does not hold its
+          request channel open indefinitely.
         """
-        # if an auth is in flight-- and not done-- just pass that back as the future to wait on
-        if (
-            hasattr(self, "_authenticate_future")
-            and not self._authenticate_future.done()
-        ):
-            future = self._authenticate_future
-        else:
-            future = tornado.concurrent.Future()
-            self._authenticate_future = future
-            self.io_loop.create_task(self._authenticate())
+        # Every call spawns a fresh sign-in if one is not already in
+        # flight -- callers that want to skip the network roundtrip gate
+        # on ``self.authenticated`` themselves (see ``channel/client.py``).
+        # Direct callers (tests, re-auth paths) rely on ``authenticate()``
+        # always re-running ``sign_in`` so master-side key rotations are
+        # picked up.
+        future = tornado.concurrent.Future()
+        self._waiters.add(future)
+        future.add_done_callback(self._on_waiter_done)
+
+        if self._sign_in_task is None:
+            # Spawn only on ``_sign_in_task is None`` -- intentionally
+            # *not* ``or self._sign_in_task.done()``.  Asyncio schedules
+            # a task's done-callbacks via ``loop.call_soon``, not
+            # synchronously when the task finishes, so there is a real
+            # window where ``_sign_in_task.done()`` is True but
+            # ``_on_sign_in_done`` has not run yet.  A new caller
+            # entering that window under a ``.done()``-based guard
+            # would spawn a *second* sign-in task while the first's
+            # done-callback is still queued; the queued callback would
+            # then observe ``self._sign_in_task is not task`` and
+            # short-circuit without fanning out, leaving the old
+            # waiters to be resolved only by the redundant second
+            # sign-in -- an unnecessary master roundtrip per concurrent
+            # caller.  ``_sign_in_task`` is cleared to ``None`` on all
+            # teardown paths (``_on_sign_in_done`` on normal completion,
+            # ``_on_waiter_done`` on last-waiter cancel), so ``is None``
+            # alone is the correct "can spawn" predicate.
+            #
+            # A forced re-auth (for example after a caller hits
+            # ``AuthenticationError`` because the master rotated its
+            # key) also enters this branch with ``_last_result`` still
+            # holding the previous ``(True,)``.  Clear it before
+            # spawning so ``authenticated`` flips to False for the
+            # duration of the re-auth -- otherwise other callers
+            # observing the ``if not self.auth.authenticated: await
+            # self.auth.authenticate()`` gate in ``channel/client.py``
+            # would skip the wait, send with the stale key, hit
+            # ``AuthenticationError``, and bounce back into another
+            # forced re-auth.
+            self._last_result = None
+            self._sign_in_task = self.io_loop.create_task(self._authenticate())
+            self._sign_in_task.add_done_callback(self._on_sign_in_done)
 
         if callback is not None:
-
-            def handle_future(future):
-                response = future.result()
-                self.io_loop.call_soon(callback, response)
-
-            future.add_done_callback(handle_future)
+            self._wire_authenticate_callback(future, callback)
 
         return future
+
+    def _wire_authenticate_callback(self, future, callback):
+        """
+        Attach the user-supplied ``authenticate(callback=...)`` hook.
+
+        Preserves the pre-refactor semantics: ``callback`` is invoked
+        (via ``call_soon``) only on successful sign-in; on failure,
+        ``future.result()`` raises and the exception propagates out of
+        the done-callback, which tornado logs.
+        """
+
+        def handle_future(fut):
+            response = fut.result()
+            self.io_loop.call_soon(callback, response)
+
+        future.add_done_callback(handle_future)
+
+    def _on_waiter_done(self, future):
+        """
+        Done-callback attached to every caller future.  Removes the caller
+        from the waiter set and, if the set drained to empty while a
+        sign-in is still in flight, cancels the sign-in so it does not
+        hold its request channel open with no one waiting for the result.
+
+        ``Task.cancel()`` is cooperative: the task stays ``done() is
+        False`` until it next hits an await point and the
+        ``CancelledError`` propagates.  Clear ``_sign_in_task`` (and
+        ``_last_result``) *before* requesting the cancellation so a
+        fresh ``authenticate()`` call arriving during that window
+        starts over with a new task instead of latching onto the
+        doomed one -- its ``_on_sign_in_done`` short-circuits without
+        fanning out, so any caller that registered as a waiter on the
+        cancelled task would otherwise wait forever.
+        """
+        self._waiters.discard(future)
+        if (
+            not self._waiters
+            and self._sign_in_task is not None
+            and not self._sign_in_task.done()
+        ):
+            task = self._sign_in_task
+            self._sign_in_task = None
+            self._last_result = None
+            task.cancel()
+
+    def _on_sign_in_done(self, task):
+        """
+        Done-callback attached to ``_sign_in_task``.  Snapshots the waiter
+        set and clears sign-in state atomically before fanning the result
+        out, so a late-arriving ``authenticate()`` call that runs after
+        this callback returns spawns a fresh sign-in task instead of
+        latching onto the just-completed one.
+
+        If this task was superseded -- ``_on_waiter_done`` cleared
+        ``_sign_in_task`` during the pending-cancel window, or a later
+        ``authenticate()`` installed a fresh task -- return without
+        touching instance state.  The current owner of
+        ``_sign_in_task`` manages its own ``_waiters`` and
+        ``_last_result``; a stale callback must not clobber them.
+
+        A cancelled task is the "last waiter cancelled me" path -- callers
+        already cancelled their own futures so there is nothing to fan
+        out.  Any other exception (including ``OSError`` and other
+        unexpected errors that previously escaped ``_authenticate`` as
+        unhandled task exceptions) is set on every waiter so no caller
+        hangs indefinitely.
+        """
+        if self._sign_in_task is not task:
+            return
+        waiters = self._waiters
+        self._waiters = set()
+        self._sign_in_task = None
+
+        if task.cancelled():
+            self._last_result = None
+            return
+
+        exc = task.exception()
+        if exc is None:
+            self._last_result = (True,)
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.set_result(True)
+        else:
+            # Failure is *not* cached: ``_last_result`` stays ``None`` so
+            # the next ``authenticate()`` call spawns a fresh sign-in,
+            # matching the pre-refactor behavior where a done-with-
+            # exception ``_authenticate_future`` caused the retry wiring
+            # to allocate a new one.
+            self._last_result = None
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.set_exception(exc)
 
     async def _authenticate(self):
         """
@@ -1225,7 +1578,7 @@ class AsyncAuth:
             acceptance_wait_time_max = acceptance_wait_time
         creds = None
 
-        with salt.channel.client.AsyncReqChannel.factory(
+        async with salt.channel.client.AsyncReqChannel.factory(
             self.opts, crypt="clear", io_loop=self.io_loop
         ) as channel:
             error = None
@@ -1308,55 +1661,52 @@ class AsyncAuth:
                     error = SaltClientError(
                         "Attempt to authenticate with the salt master failed"
                     )
-                self._authenticate_future.set_exception(error)
+                raise error
+            key = self.__key(self.opts)
+            new_aes, changed_aes, changed_session = False, False, False
+            # ``self._creds is None`` covers the first-authentication case
+            # even when a sibling ``AsyncAuth`` for the same key raced us
+            # into ``creds_map``. See issue #67947.
+            if key not in AsyncAuth.creds_map or self._creds is None:
+                new_aes = True
+                log.debug("%s Got new master aes key.", self)
             else:
-                key = self.__key(self.opts)
-                new_aes, changed_aes, changed_session = False, False, False
-                # ``self._creds is None`` covers the first-authentication case
-                # even when a sibling ``AsyncAuth`` for the same key raced us
-                # into ``creds_map``. See issue #67947.
-                if key not in AsyncAuth.creds_map or self._creds is None:
-                    new_aes = True
-                    log.debug("%s Got new master aes key.", self)
-                else:
-                    if self._creds["aes"] != creds["aes"]:
-                        changed_aes = True
-                        log.debug("%s The master's aes key has changed.", self)
-                    if self._creds["session"] != creds["session"]:
-                        changed_session = True
-                        log.debug("%s The master's session key has changed.", self)
-                if new_aes or changed_aes or changed_session:
-                    AsyncAuth.creds_map[key] = creds
-                    self._creds = creds
-                    self._crypticle = Crypticle(self.opts, creds["aes"])
-                    self._session_crypticle = Crypticle(self.opts, creds["session"])
+                if self._creds["aes"] != creds["aes"]:
+                    changed_aes = True
+                    log.debug("%s The master's aes key has changed.", self)
+                if self._creds["session"] != creds["session"]:
+                    changed_session = True
+                    log.debug("%s The master's session key has changed.", self)
+            if new_aes or changed_aes or changed_session:
+                AsyncAuth.creds_map[key] = creds
+                self._creds = creds
+                self._crypticle = Crypticle(self.opts, creds["aes"])
+                self._session_crypticle = Crypticle(self.opts, creds["session"])
 
-                self._authenticate_future.set_result(
-                    True
-                )  # mark the sign-in as complete
-                # Notify the bus about creds change.
-                # Fire synchronously on the role's event bus (no io_loop) so the
-                # IPC publish completes before the `with` block tears the event
-                # session down. When fired via fire_event_async with io_loop set,
-                # the publish runs on the *calling* (sub)process io_loop and the
-                # parent minion's handle_event consumer can miss the
-                # salt/auth/creds update before the next master publish arrives,
-                # which gets silently dropped at AES decrypt because creds_map
-                # still holds the previous key (observed on macOS integration
-                # zeromq tests during state.apply-driven re-auth).
-                if self.opts.get("auth_events") is True:
-                    with salt.utils.event.get_event(
-                        self.opts.get("__role"),
-                        opts=self.opts,
-                        listen=False,
-                    ) as event:
-                        try:
-                            event.fire_event(
-                                {"key": key, "creds": creds},
-                                salt.utils.event.tagify(prefix="auth", suffix="creds"),
-                            )
-                        except Exception as exc:  # pylint: disable=broad-except
-                            log.error("Error firing auth creds event: %s", exc)
+            # Notify the bus about creds change.
+            # Fire synchronously on the role's event bus (no io_loop) so the
+            # IPC publish completes before the `with` block tears the event
+            # session down. When fired via fire_event_async with io_loop set,
+            # the publish runs on the *calling* (sub)process io_loop and the
+            # parent minion's handle_event consumer can miss the
+            # salt/auth/creds update before the next master publish arrives,
+            # which gets silently dropped at AES decrypt because creds_map
+            # still holds the previous key (observed on macOS integration
+            # zeromq tests during state.apply-driven re-auth).
+            if self.opts.get("auth_events") is True:
+                with salt.utils.event.get_event(
+                    self.opts.get("__role"),
+                    opts=self.opts,
+                    listen=False,
+                ) as event:
+                    try:
+                        event.fire_event(
+                            {"key": key, "creds": creds},
+                            salt.utils.event.tagify(prefix="auth", suffix="creds"),
+                        )
+                    except Exception as exc:  # pylint: disable=broad-except
+                        log.error("Error firing auth creds event: %s", exc)
+            return True
 
     async def sign_in(self, timeout=60, safe=True, tries=1, channel=None):
         """
@@ -1407,7 +1757,19 @@ class AsyncAuth:
                 )
         finally:
             if close_channel:
-                channel.close()
+                # Prefer ``close_async`` when the channel exposes it
+                # (``AsyncReqChannel`` does) so the underlying transport's
+                # ``_send_recv`` task drains its shutdown sentinel and
+                # releases the socket ref before we drop our reference.
+                # The sync ``close`` fallback keeps compatibility with
+                # third-party channel subclasses that predate
+                # ``close_async``.  See PR-70316 for the wedge this
+                # ordering avoids.
+                close_async = getattr(channel, "close_async", None)
+                if close_async is not None:
+                    await close_async()
+                else:
+                    channel.close()
         return self.handle_signin_response(sign_in_payload, payload)
 
     def handle_signin_response(self, sign_in_payload, payload):
@@ -1508,7 +1870,7 @@ class AsyncAuth:
             if syndic_finger:
                 if (
                     salt.utils.crypt.pem_finger(
-                        m_pub_fn, sum_type=self.opts["hash_type"]
+                        path=m_pub_fn, sum_type=self.opts["hash_type"]
                     )
                     != syndic_finger
                 ):
@@ -1517,13 +1879,24 @@ class AsyncAuth:
             if self.opts.get("master_finger", False):
                 if (
                     salt.utils.crypt.pem_finger(
-                        m_pub_fn, sum_type=self.opts["hash_type"]
+                        path=m_pub_fn, sum_type=self.opts["hash_type"]
                     )
                     != self.opts["master_finger"]
                 ):
                     self._finger_fail(self.opts["master_finger"], m_pub_fn)
 
         auth["publish_port"] = payload["publish_port"]
+        # Lift ``cluster_id`` from the auth response whenever the master
+        # publishes it.  The master's ``_topology_cluster_id_for_auth``
+        # already gates on ``topology_enabled`` + ``topology_push_cluster_grain``
+        # (both master-side opts).  Gating a second time on the MINION's
+        # opts is wrong: ``topology_enabled`` and ``topology_push_cluster_grain``
+        # are master-side knobs with no minion-side config schema entries,
+        # so they are always falsy on a minion --- the grain never
+        # arrives.  Downstream ``_store_master_cluster_id`` is additive,
+        # so lifting an absent field is a no-op.
+        if "cluster_id" in payload:
+            auth["cluster_id"] = payload["cluster_id"]
         return auth
 
     def get_keys(self):
@@ -1542,12 +1915,27 @@ class AsyncAuth:
                 log.info("Generating keys: %s", self.opts["pki_dir"])
                 (priv, pub) = gen_keys(self.opts["keysize"])
 
+                # Determine cache keys based on role
+                if self.opts.get("__role") == "client":
+                    cache_key_priv = "client.pem"
+                    cache_key_pub = "client.pub"
+                else:
+                    # minion/syndic use minion keys
+                    cache_key_priv = "minion.pem"
+                    cache_key_pub = "minion.pub"
+
                 # the cache bank is called master keys but the codepath is shared
-                # on master/minion for interacting with pki
-                self.cache.store("master_keys", "minion.pem", priv)
-                self.cache.store("master_keys", "minion.pub", pub)
+                # on master/minion/client for interacting with pki
+                self.cache.store("master_keys", cache_key_priv, priv)
+                self.cache.store("master_keys", cache_key_pub, pub)
             else:
-                priv = self.cache.fetch("master_keys", "minion.pem")
+                # Determine cache key based on role
+                if self.opts.get("__role") == "client":
+                    cache_key_priv = "client.pem"
+                else:
+                    cache_key_priv = "minion.pem"
+
+                priv = self.cache.fetch("master_keys", cache_key_priv)
 
             self._private_key = PrivateKey.from_str(priv, None)
         return self._private_key
@@ -1582,6 +1970,8 @@ class AsyncAuth:
         payload["nonce"] = uuid.uuid4().hex
         payload["enc_algo"] = self.opts["encryption_algorithm"]
         payload["sig_algo"] = self.opts["signing_algorithm"]
+        # Include role to distinguish clients from minions
+        payload["role"] = self.opts.get("__role", "minion")
         if "autosign_grains" in self.opts:
             autosign_grains = {}
             for grain in self.opts["autosign_grains"]:
@@ -1637,7 +2027,9 @@ class AsyncAuth:
                 try:
                     mkey = PublicKey.from_file(m_path)
                 except Exception:  # pylint: disable=broad-except
-                    log.exception("Something unexpected occured loading master pub-key")
+                    log.exception(
+                        "Something unexpected occurred loading master pub-key"
+                    )
                     return "", ""
                 digest = hashlib.sha256(key_str).hexdigest()
                 digest = salt.utils.stringutils.to_bytes(digest)
@@ -1883,16 +2275,58 @@ class AsyncAuth:
                 return self.extract_aes(payload, master_pub=False)
 
     def _finger_fail(self, finger, master_key):
-        log.critical(
-            "The specified fingerprint in the master configuration "
-            "file:\n%s\nDoes not match the authenticating master's "
-            "key:\n%s\nVerify that the configured fingerprint "
-            "matches the fingerprint of the correct master and that "
-            "this minion is not subject to a man-in-the-middle attack.",
-            finger,
-            salt.utils.crypt.pem_finger(master_key, sum_type=self.opts["hash_type"]),
+        actual = salt.utils.crypt.pem_finger(
+            master_key, sum_type=self.opts["hash_type"]
         )
-        sys.exit(42)
+        role = self.opts.get("__role", "minion")
+        # Point the operator at the right file.  ``conf_file`` is the
+        # per-role conf path (``/etc/salt/minion`` or
+        # ``/etc/salt/client``); fall back to the role default if the
+        # opt isn't populated.
+        default_conf = "/etc/salt/client" if role == "client" else "/etc/salt/minion"
+        conf_file = self.opts.get("conf_file") or default_conf
+        # The opt name differs when the sign-in is going through the
+        # syndic branch (see :meth:`handle_signin_response`); report
+        # whichever opt the operator actually set.
+        opt_key = "syndic_finger" if self.opts.get("syndic_master") else "master_finger"
+        # A length mismatch on the two fingerprint strings almost
+        # always means the configured value was produced with a
+        # different hash algorithm than the local ``hash_type`` opt.
+        # Call that out explicitly -- otherwise the error looks
+        # identical to a real MITM and the operator panics.
+        hash_type = self.opts.get("hash_type", "sha256")
+        hash_hint = ""
+        if len(finger.replace(":", "")) != len(actual.replace(":", "")):
+            hash_hint = (
+                "\nFingerprint lengths differ, which usually indicates a hash "
+                "algorithm mismatch.  This %s is using hash_type=%r; "
+                "regenerate the fingerprint with the same algorithm "
+                "(e.g. ``salt-key -F master`` on a master with "
+                "matching hash_type)." % (role, hash_type)
+            )
+        log.critical(
+            "The fingerprint configured as '%s' in %s:\n%s\n"
+            "does not match the authenticating master's key:\n%s\n"
+            "Verify that the configured fingerprint matches the correct "
+            "master's pubkey and that this %s is not subject to a "
+            "man-in-the-middle attack.%s",
+            opt_key,
+            conf_file,
+            finger,
+            actual,
+            role,
+            hash_hint,
+        )
+        # Raise rather than ``sys.exit`` so the error propagates
+        # cleanly through the AsyncAuth retry loop (caught as
+        # ``SaltClientError`` by ``_authenticate``) instead of
+        # terminating the process from inside an asyncio Task --
+        # which triggers a "Task exception was never retrieved"
+        # traceback that drowns out the critical diagnostic above.
+        raise SaltClientError(
+            "master fingerprint mismatch: configured {}={} does not match "
+            "the master's pubkey fingerprint {}".format(opt_key, finger, actual)
+        )
 
 
 # TODO: remove, we should just return a sync wrapper of AsyncAuth
@@ -2121,6 +2555,47 @@ class Crypticle:
         b64key = b64key.decode("utf-8")
         # Return data must be a base64-encoded string, not a unicode type
         return b64key.replace("\n", "")
+
+    @classmethod
+    def derive_session_key(
+        cls, cluster_pem_bytes, cluster_aes, minion_id, key_size=192
+    ):
+        """
+        Derive a per-minion session key from the cluster RSA private key
+        (``cluster.pem``) via HKDF-SHA256, with ``cluster_aes`` used as the
+        HKDF salt so a cluster-wide aes rotation rotates every derived
+        session key.
+
+        ``cluster.pem`` is distributed master-to-master via
+        ``cluster/peer/join-reply`` and never appears in a minion auth
+        reply, so minions cannot derive each other's session keys even
+        though they all share ``cluster_aes`` (which they receive in
+        order to decrypt publish-channel broadcasts).  Every peer master
+        has ``cluster.pem`` plus the current ``cluster_aes``, so each one
+        derives an identical session key for the same minion without any
+        replication of the per-minion ``sessions/<minion>`` file.
+
+        Returns the same base64-encoded shape as
+        :meth:`generate_key_string` so callers can feed it to
+        ``Crypticle(opts, key_string)`` unchanged.
+        """
+        if not isinstance(cluster_aes, bytes):
+            cluster_aes = salt.utils.stringutils.to_bytes(cluster_aes)
+        if not isinstance(cluster_pem_bytes, bytes):
+            cluster_pem_bytes = salt.utils.stringutils.to_bytes(cluster_pem_bytes)
+        # SHA-256 of cluster.pem compacts the IKM to 32 bytes with no
+        # security loss and avoids feeding a multi-kilobyte PEM into
+        # HKDF-Extract on every cache miss.
+        ikm = hashlib.sha256(cluster_pem_bytes).digest()
+        hkdf = HKDF(
+            algorithm=hashes.SHA256(),
+            length=key_size // 8 + cls.SIG_SIZE,
+            salt=cluster_aes,
+            info=b"salt-cluster-session-key/"
+            + salt.utils.stringutils.to_bytes(minion_id),
+        )
+        key = hkdf.derive(ikm)
+        return base64.b64encode(key).decode("utf-8").replace("\n", "")
 
     @classmethod
     def write_key(cls, path, key_size=192):
